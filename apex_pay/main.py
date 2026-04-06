@@ -1,0 +1,129 @@
+"""
+APEX-Pay — FastAPI Application Entry Point
+============================================
+Wires together all components:
+    • Gateway + Admin routers
+    • SlowAPI rate limiter
+    • Pydantic Logfire instrumentation
+    • Redis audit queue lifecycle
+    • Background audit worker task
+    • Graceful shutdown (connection pool disposal)
+
+Run:
+    uvicorn apex_pay.main:app --reload --port 8000
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+import logfire
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from apex_pay.core.config import settings
+from apex_pay.core.database import dispose_engines
+from apex_pay.routers import admin, gateway
+from apex_pay.services.audit_queue import AuditQueue
+from apex_pay.workers.audit_worker import drain_audit_queue
+
+logger = logging.getLogger("apex_pay")
+
+
+# =============================================================================
+# Logfire — Real-Time Observability (blueprint §Step 3)
+# =============================================================================
+logfire.configure(
+    token=settings.logfire.token or None,
+    service_name=settings.logfire.service_name,
+    environment=settings.logfire.environment,
+    send_to_logfire="if-token-present",  # Console-only when no token
+)
+
+
+# =============================================================================
+# Lifespan — startup / shutdown hooks
+# =============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage Redis connection and background worker lifecycle."""
+
+    # ── Startup ─────────────────────────────────────────────────────────
+    audit_queue = AuditQueue()
+    try:
+        await audit_queue.connect()
+        logger.info("Redis audit queue connected.")
+    except Exception:
+        logger.warning("Redis unavailable — audit logging will degrade gracefully.")
+
+    app.state.audit_queue = audit_queue
+
+    # Launch background audit worker
+    worker_task = asyncio.create_task(drain_audit_queue(audit_queue))
+
+    yield
+
+    # ── Shutdown ────────────────────────────────────────────────────────
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    await audit_queue.close()
+    await dispose_engines()
+    logger.info("APEX-Pay shut down cleanly.")
+
+
+# =============================================================================
+# Application Factory
+# =============================================================================
+app = FastAPI(
+    title=settings.app_name,
+    description=(
+        "Agentic Transaction Gateway — intercepts AI agent tool-calls "
+        "and validates them against a policy-gated execution layer."
+    ),
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# ── Logfire: instrument FastAPI ─────────────────────────────────────────────
+logfire.instrument_fastapi(app)
+
+# ── CORS (permissive for dev, tighten in production) ────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Rate Limiter ────────────────────────────────────────────────────────────
+app.state.limiter = gateway.limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ── Routers ─────────────────────────────────────────────────────────────────
+app.include_router(gateway.router)
+app.include_router(admin.router)
+
+
+# ── Global Error Handler ────────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    logfire.error(
+        "Unhandled exception: {error}",
+        error=str(exc),
+        path=request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error."},
+    )

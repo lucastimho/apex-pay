@@ -1,0 +1,26 @@
+# APEX-Pay: Agentic Transaction Gateway
+# Core
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Database (Supabase / PostgreSQL)
+asyncpg==0.30.0
+sqlalchemy[asyncio]==2.0.36
+
+# Rate Limiting
+slowapi==0.1.9
+
+# Redis (async audit queue)
+redis[hiredis]==5.2.1
+
+# Observability
+logfire[fastapi]==2.11.1
+
+# Cryptography
+cryptography==44.0.0
+PyJWT==2.10.1
+
+# HTTP client (for outbound signed requests)
+httpx==0.28.1

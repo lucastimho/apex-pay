@@ -23,8 +23,10 @@ import logfire
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import _rate_limit_exceeded_handler
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from apex_pay.core.config import settings
 from apex_pay.core.database import dispose_engines
@@ -109,8 +111,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Rate Limiter ────────────────────────────────────────────────────────────
-app.state.limiter = gateway.limiter
+# ── Rate Limiter (app-level middleware, not per-route decorators) ────────────
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[settings.rate_limit.default],
+)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Routers ─────────────────────────────────────────────────────────────────

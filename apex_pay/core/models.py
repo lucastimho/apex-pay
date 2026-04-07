@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -18,8 +19,8 @@ from sqlalchemy import (
     Numeric,
     Text,
     UniqueConstraint,
+    Uuid,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -32,7 +33,7 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        Uuid, primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     public_key: Mapped[str] = mapped_column(Text, nullable=False)
@@ -67,10 +68,10 @@ class Policy(Base):
     __tablename__ = "policies"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        Uuid, primary_key=True, default=uuid.uuid4
     )
     agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
     )
     max_per_transaction: Mapped[float] = mapped_column(
         Numeric(18, 4), nullable=False, default=10.0
@@ -78,7 +79,7 @@ class Policy(Base):
     daily_limit: Mapped[float] = mapped_column(
         Numeric(18, 4), nullable=False, default=100.0
     )
-    allowed_domains: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
+    allowed_domains: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow
@@ -102,19 +103,19 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        Uuid, primary_key=True, default=uuid.uuid4
     )
     agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL"), nullable=False
+        Uuid, ForeignKey("agents.id", ondelete="SET NULL"), nullable=False
     )
-    raw_intent: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    raw_intent: Mapped[dict] = mapped_column(JSON, nullable=False)
     projected_cost: Mapped[float | None] = mapped_column(Numeric(18, 4))
     action_domain: Mapped[str | None] = mapped_column(Text)
     risk_score: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     denial_reason: Mapped[str | None] = mapped_column(Text)
-    transaction_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    policy_snapshot: Mapped[dict | None] = mapped_column(JSONB)
+    transaction_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    policy_snapshot: Mapped[dict | None] = mapped_column(JSON)
     latency_ms: Mapped[float | None] = mapped_column(Numeric(10, 2))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow
@@ -136,10 +137,10 @@ class Transaction(Base):
     __tablename__ = "transactions"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        Uuid, primary_key=True, default=uuid.uuid4
     )
     agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False
+        Uuid, ForeignKey("agents.id"), nullable=False
     )
     ref_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     amount: Mapped[float] = mapped_column(Numeric(18, 4), nullable=False)

@@ -94,7 +94,11 @@ app = FastAPI(
 )
 
 # ── Logfire: instrument FastAPI ─────────────────────────────────────────────
-logfire.instrument_fastapi(app)
+try:
+    logfire.instrument_fastapi(app)
+except Exception as _logfire_err:
+    logger.warning("Logfire FastAPI instrumentation unavailable: %s", _logfire_err)
+    logger.warning("Observability will fall back to manual logfire.info() calls.")
 
 # ── CORS (permissive for dev, tighten in production) ────────────────────────
 app.add_middleware(

@@ -20,8 +20,6 @@ from datetime import datetime, timezone
 
 import logfire
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,7 +40,6 @@ from apex_pay.services.policy_engine import PolicyEngine
 from apex_pay.services.token_service import TokenService
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 policy_engine = PolicyEngine()
 token_service = TokenService()
 
@@ -69,7 +66,6 @@ def get_audit_queue(request: Request) -> AuditQueue:
     summary="Intercept an agent tool-call and validate against policy",
     tags=["gateway"],
 )
-@limiter.limit(settings.rate_limit.per_agent)
 async def execute_tool_call(
     request: Request,
     payload: ToolCallPayload,
@@ -146,7 +142,6 @@ async def execute_tool_call(
     summary="Access protected data — returns 402 challenge or data",
     tags=["gateway"],
 )
-@limiter.limit(settings.rate_limit.default)
 async def get_data(
     request: Request,
     baseline: str = "payment_with_policy",
@@ -235,7 +230,6 @@ async def get_data(
     summary="Settle a payment challenge and receive a signed token",
     tags=["gateway"],
 )
-@limiter.limit(settings.rate_limit.per_agent)
 async def settle_payment(
     request: Request,
     body: SettlementRequest,

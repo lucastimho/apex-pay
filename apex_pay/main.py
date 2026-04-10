@@ -30,7 +30,7 @@ from slowapi.util import get_remote_address
 
 from apex_pay.core.config import settings
 from apex_pay.core.database import dispose_engines
-from apex_pay.routers import admin, gateway
+from apex_pay.routers import admin, dashboard, gateway
 from apex_pay.services.audit_queue import AuditQueue
 from apex_pay.workers.audit_worker import drain_audit_queue
 
@@ -123,6 +123,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ── Routers ─────────────────────────────────────────────────────────────────
 app.include_router(gateway.router)
 app.include_router(admin.router)
+app.include_router(dashboard.router)
 
 
 # ── Global Error Handler ────────────────────────────────────────────────────

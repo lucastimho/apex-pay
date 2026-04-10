@@ -18,7 +18,7 @@ class _DatabaseDSN(BaseSettings):
     apex_readonly — SELECT-only for dashboards
     """
 
-    model_config = SettingsConfigDict(env_prefix="DB_")
+    model_config = SettingsConfigDict(env_prefix="DB_", env_file=".env", extra="ignore")
 
     gateway_dsn: str = (
         "postgresql+asyncpg://apex_gateway:change_me_gateway"
@@ -39,7 +39,7 @@ class _DatabaseDSN(BaseSettings):
 class _RedisSettings(BaseSettings):
     """Redis connection for the async audit queue."""
 
-    model_config = SettingsConfigDict(env_prefix="REDIS_")
+    model_config = SettingsConfigDict(env_prefix="REDIS_", env_file=".env", extra="ignore")
 
     url: str = "redis://localhost:6379/0"
     audit_queue_name: str = "apex:audit_queue"
@@ -49,7 +49,7 @@ class _RedisSettings(BaseSettings):
 class _SecuritySettings(BaseSettings):
     """Cryptographic and token lifecycle settings."""
 
-    model_config = SettingsConfigDict(env_prefix="SECURITY_")
+    model_config = SettingsConfigDict(env_prefix="SECURITY_", env_file=".env", extra="ignore")
 
     hmac_secret_key: str = "CHANGE-ME-IN-PRODUCTION"  # HMAC-SHA256 signing key
     token_ttl_seconds: int = 300                       # 5-minute token validity
@@ -59,7 +59,7 @@ class _SecuritySettings(BaseSettings):
 class _RateLimitSettings(BaseSettings):
     """SlowAPI rate-limit defaults."""
 
-    model_config = SettingsConfigDict(env_prefix="RATELIMIT_")
+    model_config = SettingsConfigDict(env_prefix="RATELIMIT_", env_file=".env", extra="ignore")
 
     default: str = "60/minute"
     per_agent: str = "30/minute"
@@ -68,7 +68,7 @@ class _RateLimitSettings(BaseSettings):
 class _LogfireSettings(BaseSettings):
     """Pydantic Logfire configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="LOGFIRE_")
+    model_config = SettingsConfigDict(env_prefix="LOGFIRE_", env_file=".env", extra="ignore")
 
     token: str = ""             # Logfire API token (empty → local console)
     service_name: str = "apex-pay"

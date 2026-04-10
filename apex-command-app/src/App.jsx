@@ -4,27 +4,47 @@ import {
   Users, AlertTriangle, Eye, EyeOff, Search, ChevronRight, X,
   Zap, Globe, Clock, TrendingUp, BarChart3, Settings, Power,
   RefreshCw, Filter, Bell, Terminal, Cpu, Radio, CircleDot,
-  ChevronDown, Check, Pencil, Save, Ban, ExternalLink, WifiOff,
+  ChevronDown, Check, Pencil, Save, Ban, ExternalLink,
 } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// API CONFIG — Point at the running APEX-Pay FastAPI backend
+// MOCK DATA — Replace with TanStack Query calls to APEX-Pay FastAPI backend
 // ═══════════════════════════════════════════════════════════════════════════
-const API_BASE = "http://localhost:8000";
+const MOCK_AGENTS = [
+  { id: "a1", name: "GPT-Buyer", status: "active", balance: 342.18, dailySpend: 157.82, dailyLimit: 200, riskAvg: 22, txCount: 48 },
+  { id: "a2", name: "Claude-Ops", status: "active", balance: 891.50, dailySpend: 42.50, dailyLimit: 500, riskAvg: 8, txCount: 15 },
+  { id: "a3", name: "Agent-Smith", status: "suspended", balance: 0, dailySpend: 200, dailyLimit: 200, riskAvg: 87, txCount: 112 },
+  { id: "a4", name: "Gemini-Pay", status: "active", balance: 1250.00, dailySpend: 89.00, dailyLimit: 300, riskAvg: 31, txCount: 27 },
+  { id: "a5", name: "Llama-Trade", status: "active", balance: 455.33, dailySpend: 178.67, dailyLimit: 250, riskAvg: 56, txCount: 63 },
+];
 
-async function apiFetch(path, opts = {}) {
-  try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json", ...opts.headers },
-      ...opts,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return { data: await res.json(), error: null };
-  } catch (err) {
-    return { data: null, error: err.message };
-  }
+const STATUSES = ["APPROVED", "DENIED", "PENDING_REVIEW"];
+const DOMAINS = ["api.stripe.com", "api.openai.com", "api.shopify.com", "payments.google.com", "evil.example.com"];
+const FUNCTIONS = ["charge_card", "book_flight", "subscribe", "purchase_api_credits", "transfer_funds", "refund", "list_products"];
+
+function generateAuditEntry(i) {
+  const status = STATUSES[Math.random() < 0.55 ? 0 : Math.random() < 0.7 ? 1 : 2];
+  const agent = MOCK_AGENTS[Math.floor(Math.random() * MOCK_AGENTS.length)];
+  const cost = +(Math.random() * 80 + 1).toFixed(2);
+  const risk = Math.min(100, Math.max(0, Math.floor(Math.random() * 100)));
+  return {
+    id: `log-${Date.now()}-${i}`,
+    timestamp: new Date(Date.now() - Math.random() * 86400000).toISOString(),
+    agentName: agent.name,
+    agentId: agent.id,
+    status,
+    function: FUNCTIONS[Math.floor(Math.random() * FUNCTIONS.length)],
+    domain: DOMAINS[Math.floor(Math.random() * DOMAINS.length)],
+    cost,
+    riskScore: risk,
+    reason: status === "DENIED" ? (risk > 60 ? "daily_budget_exceeded" : "domain_not_allowed") : status === "PENDING_REVIEW" ? "elevated_risk_score" : "policy_passed",
+    rawIntent: { function: "charge_card", target_url: `https://${DOMAINS[Math.floor(Math.random() * DOMAINS.length)]}/v1/charges`, parameters: { amount: cost, currency: "USD" } },
+  };
 }
+
+const INITIAL_LOGS = Array.from({ length: 60 }, (_, i) => generateAuditEntry(i))
+  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THEME TOKENS — Cyber-Noir palette
@@ -59,7 +79,6 @@ function StatusBadge({ status }) {
     APPROVED: { color: T.emerald, icon: <ShieldCheck size={12} /> },
     DENIED: { color: T.rose, icon: <ShieldX size={12} /> },
     PENDING_REVIEW: { color: T.amber, icon: <ShieldAlert size={12} /> },
-    ERROR: { color: T.amber, icon: <ShieldAlert size={12} /> },
   };
   const s = map[status] || map.APPROVED;
   return <Badge color={s.color}>{s.icon} {status.replace("_", " ")}</Badge>;
@@ -108,20 +127,6 @@ function Btn({ children, variant = "default", style, ...props }) {
   return <button style={{ ...base, ...variants[variant], ...style }} {...props}>{children}</button>;
 }
 
-function ConnectionBanner({ connected }) {
-  if (connected) return null;
-  return (
-    <div style={{
-      background: T.roseDim + "20", border: `1px solid ${T.roseDim}40`, borderRadius: 8,
-      padding: "10px 16px", display: "flex", alignItems: "center", gap: 10,
-      fontSize: 13, color: T.rose,
-    }}>
-      <WifiOff size={16} />
-      <span>Cannot reach backend at <b>{API_BASE}</b> — showing cached data. Start the API with: <code style={{ background: T.surfaceAlt, padding: "2px 6px", borderRadius: 4 }}>python -m uvicorn apex_pay.main:app --reload --port 8000</code></span>
-    </div>
-  );
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // RISK METER — Semi-circle SVG gauge
 // ═══════════════════════════════════════════════════════════════════════════
@@ -143,12 +148,15 @@ function RiskMeter({ score = 0, size = 140 }) {
             <stop offset="100%" stopColor={T.rose} />
           </linearGradient>
         </defs>
+        {/* Track */}
         <path d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`}
           fill="none" stroke={T.border} strokeWidth={strokeW} strokeLinecap="round" />
+        {/* Fill */}
         <path d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`}
           fill="none" stroke={color} strokeWidth={strokeW} strokeLinecap="round"
           strokeDasharray={circumference} strokeDashoffset={offset}
           style={{ transition: "stroke-dashoffset 0.8s ease, stroke 0.4s ease", filter: `drop-shadow(0 0 6px ${color}60)` }} />
+        {/* Score */}
         <text x={cx} y={cy - 12} textAnchor="middle" fill={T.text} fontSize="28" fontWeight="800" fontFamily="inherit">{clamp}</text>
         <text x={cx} y={cy + 4} textAnchor="middle" fill={color} fontSize="10" fontWeight="700" fontFamily="inherit" letterSpacing="0.1em">{label} RISK</text>
       </svg>
@@ -160,7 +168,6 @@ function RiskMeter({ score = 0, size = 140 }) {
 // HEAT BAR — Budget utilisation (blue → orange → red)
 // ═══════════════════════════════════════════════════════════════════════════
 function HeatBar({ spent, limit }) {
-  if (!limit || limit <= 0) return null;
   const pct = Math.min(100, (spent / limit) * 100);
   const color = pct < 50 ? T.accent : pct < 80 ? T.amber : T.rose;
   return (
@@ -177,7 +184,7 @@ function HeatBar({ spent, limit }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// RESPONSIVE HOOK
+// STAT CARD — Dashboard top row
 // ═══════════════════════════════════════════════════════════════════════════
 function useIsMobile(breakpoint = 768) {
   const [mobile, setMobile] = useState(typeof window !== "undefined" ? window.innerWidth < breakpoint : false);
@@ -191,9 +198,6 @@ function useIsMobile(breakpoint = 768) {
   return mobile;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STAT CARD
-// ═══════════════════════════════════════════════════════════════════════════
 function StatCard({ icon, label, value, sub, color = T.accent }) {
   return (
     <Card style={{ flex: "1 1 260px", minWidth: 0 }}>
@@ -211,38 +215,24 @@ function StatCard({ icon, label, value, sub, color = T.accent }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AUDIT FEED — Live Nerve Center (fetches from /dashboard/audit-logs)
+// AUDIT FEED — Live Nerve Center
 // ═══════════════════════════════════════════════════════════════════════════
-function AuditFeed({ logs, totalEvents, onSelect, onRefresh, loading }) {
+function AuditFeed({ logs, onSelect }) {
   const [filter, setFilter] = useState("ALL");
   const [search, setSearch] = useState("");
-
   const filtered = useMemo(() => {
     let r = logs;
     if (filter !== "ALL") r = r.filter(l => l.status === filter);
-    if (search) r = r.filter(l =>
-      l.agentName?.toLowerCase().includes(search.toLowerCase()) ||
-      l.function?.toLowerCase().includes(search.toLowerCase()) ||
-      l.domain?.toLowerCase().includes(search.toLowerCase())
-    );
+    if (search) r = r.filter(l => l.agentName.toLowerCase().includes(search.toLowerCase()) || l.function.toLowerCase().includes(search.toLowerCase()) || l.domain?.toLowerCase().includes(search.toLowerCase()));
     return r;
   }, [logs, filter, search]);
 
   return (
     <Card style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 400 }}>
-      <SectionHeader
-        icon={<Radio size={18} />}
-        title="Live Nerve Center"
-        subtitle={`${totalEvents} events (24h) — ${logs.length} loaded`}
-        action={
-          <Btn variant="ghost" onClick={onRefresh} style={{ padding: "4px 8px" }}>
-            <RefreshCw size={14} className={loading ? "spin" : ""} />
-          </Btn>
-        }
-      />
+      <SectionHeader icon={<Radio size={18} />} title="Live Nerve Center" subtitle={`${logs.length} events — streaming`} />
       {/* Toolbar */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-        {["ALL", "APPROVED", "DENIED", "ERROR"].map(f => (
+        {["ALL", "APPROVED", "DENIED", "PENDING_REVIEW"].map(f => (
           <Btn key={f} variant={filter === f ? "primary" : "default"} onClick={() => setFilter(f)}
             style={{ fontSize: 11, padding: "4px 10px" }}>
             {f === "ALL" ? "All" : f.replace("_", " ")}
@@ -250,17 +240,13 @@ function AuditFeed({ logs, totalEvents, onSelect, onRefresh, loading }) {
         ))}
         <div style={{ flex: "1 1 160px", minWidth: 120, display: "flex", alignItems: "center", gap: 6, background: T.surfaceAlt, borderRadius: 8, padding: "0 10px", border: `1px solid ${T.border}` }}>
           <Search size={14} color={T.textDim} style={{ flexShrink: 0 }} />
-          <input placeholder="Search agent, function, domain…" value={search} onChange={e => setSearch(e.target.value)}
+          <input placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)}
             style={{ background: "none", border: "none", color: T.text, fontSize: 12, padding: "6px 0", outline: "none", width: "100%", minWidth: 0, fontFamily: "inherit" }} />
         </div>
       </div>
       {/* Log list */}
       <div style={{ flex: 1, overflowY: "auto", maxHeight: 360 }}>
-        {filtered.length === 0 && (
-          <p style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 30 }}>
-            {logs.length === 0 ? "No audit events yet. Send requests to /execute to generate activity." : "No matching events."}
-          </p>
-        )}
+        {filtered.length === 0 && <p style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 30 }}>No matching events.</p>}
         {filtered.map(log => (
           <div key={log.id} onClick={() => onSelect(log)}
             style={{
@@ -280,12 +266,12 @@ function AuditFeed({ logs, totalEvents, onSelect, onRefresh, loading }) {
               </div>
               <div style={{ fontSize: 11, color: T.textDim, marginTop: 3, display: "flex", gap: 12 }}>
                 <span><Globe size={10} style={{ verticalAlign: "-1px" }} /> {log.domain || "internal"}</span>
-                <span><DollarSign size={10} style={{ verticalAlign: "-1px" }} /> ${(log.cost || 0).toFixed(2)}</span>
-                <span>Risk: {log.riskScore ?? 0}</span>
+                <span><DollarSign size={10} style={{ verticalAlign: "-1px" }} /> ${log.cost.toFixed(2)}</span>
+                <span>Risk: {log.riskScore}</span>
               </div>
             </div>
             <span style={{ fontSize: 11, color: T.textDim, whiteSpace: "nowrap" }}>
-              {log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : "—"}
+              {new Date(log.timestamp).toLocaleTimeString()}
             </span>
             <ChevronRight size={14} color={T.textDim} />
           </div>
@@ -312,16 +298,16 @@ function LogDetail({ log, onClose }) {
         </div>
         <StatusBadge status={log.status} />
         <div style={{ marginTop: 20 }}>
-          <RiskMeter score={log.riskScore ?? 0} size={160} />
+          <RiskMeter score={log.riskScore} size={160} />
         </div>
-        {/* Intent Analyzer */}
+        {/* Intent Analyzer — Semantic Highlight */}
         <div style={{ marginTop: 20 }}>
           <p style={{ fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Intent Analysis</p>
           <div style={{ background: T.surfaceAlt, borderRadius: 8, padding: 14, fontSize: 13, color: T.textMuted, lineHeight: 1.6 }}>
             Agent <b style={{ color: T.cyan }}>{log.agentName}</b> requested{" "}
             <b style={{ color: T.violet }}>{log.function}()</b> targeting{" "}
             <b style={{ color: T.accent }}>{log.domain}</b> for{" "}
-            <b style={{ color: T.amber }}>${(log.cost || 0).toFixed(2)}</b>.
+            <b style={{ color: T.amber }}>${log.cost.toFixed(2)}</b>.
             {log.status === "DENIED" && <span style={{ color: T.rose }}> Blocked: {log.reason}.</span>}
             {log.status === "APPROVED" && <span style={{ color: T.emerald }}> Transaction cleared.</span>}
           </div>
@@ -330,9 +316,8 @@ function LogDetail({ log, onClose }) {
         <div style={{ marginTop: 20 }}>
           {[
             ["Agent", log.agentName], ["Function", log.function], ["Domain", log.domain],
-            ["Cost", `$${(log.cost || 0).toFixed(2)}`], ["Risk Score", log.riskScore ?? 0],
-            ["Reason", log.reason], ["Latency", log.latencyMs ? `${log.latencyMs.toFixed(1)}ms` : "—"],
-            ["Timestamp", log.timestamp ? new Date(log.timestamp).toLocaleString() : "—"],
+            ["Cost", `$${log.cost.toFixed(2)}`], ["Risk Score", log.riskScore],
+            ["Reason", log.reason], ["Timestamp", new Date(log.timestamp).toLocaleString()],
           ].map(([k, v]) => (
             <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${T.border}`, fontSize: 13 }}>
               <span style={{ color: T.textDim }}>{k}</span>
@@ -347,32 +332,18 @@ function LogDetail({ log, onClose }) {
             {JSON.stringify(log.rawIntent, null, 2)}
           </pre>
         </div>
-        {/* Policy Snapshot */}
-        {log.policySnapshot && (
-          <div style={{ marginTop: 20 }}>
-            <p style={{ fontSize: 11, color: T.textDim, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Policy Snapshot</p>
-            <pre style={{ background: T.bg, borderRadius: 8, padding: 14, fontSize: 11, color: T.violet, overflow: "auto", maxHeight: 160, border: `1px solid ${T.border}`, margin: 0, fontFamily: "monospace", lineHeight: 1.5 }}>
-              {JSON.stringify(log.policySnapshot, null, 2)}
-            </pre>
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AGENT REGISTRY — with Kill Switch (wired to PATCH /dashboard/agents/:id/status)
+// AGENT REGISTRY — with Kill Switch
 // ═══════════════════════════════════════════════════════════════════════════
-function AgentRegistry({ agents, onToggle, loading }) {
+function AgentRegistry({ agents, onToggle }) {
   return (
     <Card>
       <SectionHeader icon={<Cpu size={18} />} title="Agent Registry" subtitle={`${agents.filter(a => a.status === "active").length} active of ${agents.length}`} />
-      {agents.length === 0 && (
-        <p style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 20 }}>
-          No agents registered. Use <code style={{ background: T.surfaceAlt, padding: "2px 6px", borderRadius: 4 }}>POST /admin/agents</code> to create one.
-        </p>
-      )}
       <div style={{ display: "grid", gap: 10 }}>
         {agents.map(agent => {
           const active = agent.status === "active";
@@ -383,19 +354,22 @@ function AgentRegistry({ agents, onToggle, loading }) {
               border: `1px solid ${active ? T.border : T.roseDim + "40"}`,
               opacity: active ? 1 : 0.65,
             }}>
+              {/* Status dot */}
               <div style={{ width: 10, height: 10, borderRadius: "50%", background: active ? T.emerald : T.rose, boxShadow: `0 0 8px ${active ? T.emerald : T.rose}50`, flexShrink: 0 }} />
+              {/* Info */}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ fontSize: 14, fontWeight: 700, color: T.text }}>{agent.name}</span>
                   <Badge color={active ? T.emerald : T.rose}>{active ? "ACTIVE" : "SUSPENDED"}</Badge>
                 </div>
                 <div style={{ fontSize: 11, color: T.textDim, marginTop: 3, display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  <span>Balance: <b style={{ color: T.text }}>${(agent.balance || 0).toFixed(2)}</b></span>
-                  <span>Txns: {agent.txCount || 0}</span>
-                  <span>Avg Risk: {agent.riskAvg || 0}</span>
+                  <span>Balance: <b style={{ color: T.text }}>${agent.balance.toFixed(2)}</b></span>
+                  <span>Txns: {agent.txCount}</span>
+                  <span>Avg Risk: {agent.riskAvg}</span>
                 </div>
-                <HeatBar spent={agent.dailySpend || 0} limit={agent.dailyLimit || 1} />
+                <HeatBar spent={agent.dailySpend} limit={agent.dailyLimit} />
               </div>
+              {/* Kill switch */}
               <button onClick={() => onToggle(agent.id)}
                 title={active ? "Suspend Agent" : "Reactivate Agent"}
                 style={{
@@ -421,42 +395,17 @@ function AgentRegistry({ agents, onToggle, loading }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POLICY STUDIO — wired to POST /dashboard/policies
+// POLICY STUDIO — Form editor with validation
 // ═══════════════════════════════════════════════════════════════════════════
-function PolicyStudio({ agents }) {
-  const [selectedAgent, setSelectedAgent] = useState("");
+function PolicyStudio() {
   const [daily, setDaily] = useState("200.00");
   const [maxTxn, setMaxTxn] = useState("50.00");
   const [domains, setDomains] = useState("api.stripe.com, api.openai.com");
   const [errors, setErrors] = useState({});
   const [saved, setSaved] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  // When agents load, pick the first one and load its policy
-  useEffect(() => {
-    if (agents.length > 0 && !selectedAgent) {
-      const first = agents[0];
-      setSelectedAgent(first.id);
-      if (first.dailyLimit) setDaily(first.dailyLimit.toFixed(2));
-      if (first.maxPerTxn) setMaxTxn(first.maxPerTxn.toFixed(2));
-      if (first.allowedDomains?.length) setDomains(first.allowedDomains.join(", "));
-    }
-  }, [agents, selectedAgent]);
-
-  const onAgentChange = (agentId) => {
-    setSelectedAgent(agentId);
-    const agent = agents.find(a => a.id === agentId);
-    if (agent) {
-      if (agent.dailyLimit) setDaily(agent.dailyLimit.toFixed(2));
-      if (agent.maxPerTxn) setMaxTxn(agent.maxPerTxn.toFixed(2));
-      if (agent.allowedDomains?.length) setDomains(agent.allowedDomains.join(", "));
-      else setDomains("");
-    }
-  };
 
   const validate = () => {
     const e = {};
-    if (!selectedAgent) e.agent = "Select an agent";
     const d = parseFloat(daily);
     const m = parseFloat(maxTxn);
     if (isNaN(d) || d <= 0) e.daily = "Must be a positive number";
@@ -471,26 +420,10 @@ function PolicyStudio({ agents }) {
     return Object.keys(e).length === 0;
   };
 
-  const onSave = async () => {
+  const onSave = () => {
     if (!validate()) return;
-    setSaving(true);
-    const domList = domains.split(",").map(s => s.trim()).filter(Boolean);
-    const { data, error } = await apiFetch("/dashboard/policies", {
-      method: "POST",
-      body: JSON.stringify({
-        agent_id: selectedAgent,
-        daily_limit: parseFloat(daily),
-        max_per_transaction: parseFloat(maxTxn),
-        allowed_domains: domList,
-      }),
-    });
-    setSaving(false);
-    if (error) {
-      setErrors({ save: `Failed to save: ${error}` });
-    } else {
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    }
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
   };
 
   const inputStyle = (err) => ({
@@ -503,20 +436,6 @@ function PolicyStudio({ agents }) {
     <Card>
       <SectionHeader icon={<Settings size={18} />} title="Policy Studio" subtitle="Edit enforcement rules" />
       <div style={{ display: "grid", gap: 16 }}>
-        {/* Agent Selector */}
-        <div>
-          <label style={{ fontSize: 12, color: T.textMuted, fontWeight: 600, marginBottom: 4, display: "block" }}>
-            Agent
-          </label>
-          <select value={selectedAgent} onChange={e => onAgentChange(e.target.value)}
-            style={{ ...inputStyle(errors.agent), cursor: "pointer" }}>
-            <option value="">Select agent…</option>
-            {agents.map(a => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </select>
-          {errors.agent && <p style={{ color: T.rose, fontSize: 11, margin: "4px 0 0" }}>{errors.agent}</p>}
-        </div>
         {/* Daily Limit */}
         <div>
           <label style={{ fontSize: 12, color: T.textMuted, fontWeight: 600, marginBottom: 4, display: "block" }}>
@@ -554,9 +473,8 @@ function PolicyStudio({ agents }) {
           </div>
         </div>
         {/* Save */}
-        {errors.save && <p style={{ color: T.rose, fontSize: 12, margin: 0 }}>{errors.save}</p>}
-        <Btn variant="primary" onClick={onSave} disabled={saving} style={{ justifyContent: "center", marginTop: 4, opacity: saving ? 0.6 : 1 }}>
-          {saved ? <><Check size={14} /> Saved</> : saving ? <><RefreshCw size={14} /> Saving…</> : <><Save size={14} /> Save Policy</>}
+        <Btn variant="primary" onClick={onSave} style={{ justifyContent: "center", marginTop: 4 }}>
+          {saved ? <><Check size={14} /> Saved</> : <><Save size={14} /> Save Policy</>}
         </Btn>
       </div>
     </Card>
@@ -564,16 +482,19 @@ function PolicyStudio({ agents }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SYSTEM THROUGHPUT — Real data from /dashboard/throughput
+// SYSTEM THROUGHPUT — Mini sparkline-style via Recharts
 // ═══════════════════════════════════════════════════════════════════════════
-function ThroughputMini({ data }) {
+function ThroughputMini() {
+  const data = useMemo(() => Array.from({ length: 24 }, (_, i) => ({
+    name: `${i}:00`, approved: Math.floor(Math.random() * 40 + 10), denied: Math.floor(Math.random() * 15),
+  })), []);
   const total = data.reduce((s, d) => s + d.approved + d.denied, 0);
   return (
     <Card>
       <SectionHeader icon={<BarChart3 size={18} />} title="24h Throughput" subtitle={`${total} total requests`} />
       <div style={{ display: "flex", gap: 2, alignItems: "flex-end", height: 80 }}>
         {data.map((d, i) => {
-          const max = Math.max(1, ...data.map(x => x.approved + x.denied));
+          const max = 60;
           const aH = (d.approved / max) * 60;
           const dH = (d.denied / max) * 60;
           return (
@@ -593,61 +514,33 @@ function ThroughputMini({ data }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MAIN DASHBOARD — Fetches all data from APEX-Pay backend
+// MAIN DASHBOARD
 // ═══════════════════════════════════════════════════════════════════════════
 export default function APEXCommand() {
   const mobile = useIsMobile();
-  const [agents, setAgents] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [stats, setStats] = useState({ total_spend_24h: 0, active_agents: 0, total_agents: 0, violations_24h: 0, total_events_24h: 0 });
-  const [throughput, setThroughput] = useState(Array.from({ length: 24 }, (_, i) => ({ name: `${i}:00`, approved: 0, denied: 0 })));
+  const [agents, setAgents] = useState(MOCK_AGENTS);
+  const [logs, setLogs] = useState(INITIAL_LOGS);
   const [selectedLog, setSelectedLog] = useState(null);
   const [now, setNow] = useState(new Date());
-  const [connected, setConnected] = useState(true);
-  const [loading, setLoading] = useState(false);
 
-  // ── Fetch all dashboard data ─────────────────────────────────────────
-  const fetchAll = useCallback(async () => {
-    setLoading(true);
-    const [statsRes, agentsRes, logsRes, throughputRes] = await Promise.all([
-      apiFetch("/dashboard/stats"),
-      apiFetch("/dashboard/agents"),
-      apiFetch("/dashboard/audit-logs?limit=200"),
-      apiFetch("/dashboard/throughput"),
-    ]);
-
-    // If all fail, we're disconnected
-    const anySuccess = [statsRes, agentsRes, logsRes, throughputRes].some(r => r.data !== null);
-    setConnected(anySuccess);
-
-    if (statsRes.data) setStats(statsRes.data);
-    if (agentsRes.data) setAgents(agentsRes.data);
-    if (logsRes.data) setLogs(logsRes.data.items || []);
-    if (throughputRes.data) setThroughput(throughputRes.data);
-
-    setLoading(false);
-    setNow(new Date());
+  // Simulate live feed
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const newLog = generateAuditEntry(Date.now());
+      newLog.timestamp = new Date().toISOString();
+      setLogs(prev => [newLog, ...prev].slice(0, 200));
+      setNow(new Date());
+    }, 3000);
+    return () => clearInterval(interval);
   }, []);
 
-  // Initial fetch + polling every 5 seconds
-  useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 5000);
-    return () => clearInterval(interval);
-  }, [fetchAll]);
-
-  // ── Toggle agent status via API ──────────────────────────────────────
-  const toggleAgent = async (id) => {
-    const { data, error } = await apiFetch(`/dashboard/agents/${id}/status`, { method: "PATCH" });
-    if (data) {
-      setAgents(prev => prev.map(a => a.id === id ? { ...a, status: data.status } : a));
-    }
+  const toggleAgent = (id) => {
+    setAgents(prev => prev.map(a => a.id === id ? { ...a, status: a.status === "active" ? "suspended" : "active" } : a));
   };
 
+  const totalSpend = agents.reduce((s, a) => s + a.dailySpend, 0);
   const activeCount = agents.filter(a => a.status === "active").length;
-  const avgRisk = activeCount > 0
-    ? Math.round(agents.filter(a => a.status === "active").reduce((s, a) => s + (a.riskAvg || 0), 0) / activeCount)
-    : 0;
+  const violations = logs.filter(l => l.status === "DENIED").length;
 
   return (
     <div style={{
@@ -658,15 +551,13 @@ export default function APEXCommand() {
       <style>{`
         @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .spin { animation: spin 1s linear infinite; }
         * { scrollbar-width: thin; scrollbar-color: ${T.border} transparent; box-sizing: border-box; }
         *::-webkit-scrollbar { width: 6px; }
         *::-webkit-scrollbar-track { background: transparent; }
         *::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 3px; }
         html { -webkit-text-size-adjust: 100%; }
-        input, textarea, button, select { font-size: 16px; }
-        @media (min-width: 768px) { input, textarea, button, select { font-size: inherit; } }
+        input, textarea, button { font-size: 16px; }
+        @media (min-width: 768px) { input, textarea, button { font-size: inherit; } }
       `}</style>
 
       {/* Header */}
@@ -682,13 +573,13 @@ export default function APEXCommand() {
             APEX<span style={{ color: T.accent }}>-Command</span>
           </span>
           {!mobile && (
-            <Badge color={connected ? T.emerald : T.rose} style={{ marginLeft: 8 }}>
-              <span style={{ animation: connected ? "pulse 2s infinite" : "none" }}>●</span> {connected ? "LIVE" : "OFFLINE"}
+            <Badge color={T.emerald} style={{ marginLeft: 8 }}>
+              <span style={{ animation: "pulse 2s infinite" }}>●</span> LIVE
             </Badge>
           )}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: mobile ? 6 : 12, fontSize: 12, color: T.textDim }}>
-          {mobile && <span style={{ color: connected ? T.emerald : T.rose, animation: connected ? "pulse 2s infinite" : "none", fontSize: 10 }}>●</span>}
+          {mobile && <span style={{ color: T.emerald, animation: "pulse 2s infinite", fontSize: 10 }}>●</span>}
           <Clock size={14} />
           {now.toLocaleTimeString()}
         </div>
@@ -697,36 +588,33 @@ export default function APEXCommand() {
       {/* Content */}
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: mobile ? 12 : 24, display: "grid", gap: mobile ? 14 : 20 }}>
 
-        {/* Connection warning */}
-        <ConnectionBanner connected={connected} />
-
         {/* Row 1: Stat Cards */}
         <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(3, 1fr)", gap: mobile ? 10 : 16 }}>
-          <StatCard icon={<DollarSign size={22} />} label="Total Spend (24h)" value={`$${stats.total_spend_24h.toFixed(2)}`} sub="across all agents" color={T.accent} />
-          <StatCard icon={<Users size={22} />} label="Active Agents" value={stats.active_agents} sub={`${stats.total_agents} registered`} color={T.emerald} />
-          <StatCard icon={<AlertTriangle size={22} />} label="Policy Violations" value={stats.violations_24h} sub="denied in 24h window" color={T.rose} />
+          <StatCard icon={<DollarSign size={22} />} label="Total Spend (24h)" value={`$${totalSpend.toFixed(2)}`} sub="across all agents" color={T.accent} />
+          <StatCard icon={<Users size={22} />} label="Active Agents" value={activeCount} sub={`${agents.length} registered`} color={T.emerald} />
+          <StatCard icon={<AlertTriangle size={22} />} label="Policy Violations" value={violations} sub="denied in feed window" color={T.rose} />
         </div>
 
         {/* Row 2: Audit Feed + Sidebar */}
         {mobile ? (
           <>
-            <AuditFeed logs={logs} totalEvents={stats.total_events_24h} onSelect={setSelectedLog} onRefresh={fetchAll} loading={loading} />
+            <AuditFeed logs={logs} onSelect={setSelectedLog} />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <ThroughputMini data={throughput} />
+              <ThroughputMini />
               <Card>
                 <SectionHeader icon={<Activity size={18} />} title="System Risk" subtitle="weighted avg" />
-                <RiskMeter score={avgRisk} size={140} />
+                <RiskMeter score={Math.round(agents.filter(a => a.status === "active").reduce((s, a) => s + a.riskAvg, 0) / Math.max(1, activeCount))} size={140} />
               </Card>
             </div>
           </>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 20 }}>
-            <AuditFeed logs={logs} totalEvents={stats.total_events_24h} onSelect={setSelectedLog} onRefresh={fetchAll} loading={loading} />
+            <AuditFeed logs={logs} onSelect={setSelectedLog} />
             <div style={{ display: "grid", gap: 20 }}>
-              <ThroughputMini data={throughput} />
+              <ThroughputMini />
               <Card>
                 <SectionHeader icon={<Activity size={18} />} title="System Risk" subtitle="weighted average across agents" />
-                <RiskMeter score={avgRisk} size={180} />
+                <RiskMeter score={Math.round(agents.filter(a => a.status === "active").reduce((s, a) => s + a.riskAvg, 0) / Math.max(1, activeCount))} size={180} />
               </Card>
             </div>
           </div>
@@ -734,8 +622,8 @@ export default function APEXCommand() {
 
         {/* Row 3: Agent Registry + Policy Studio */}
         <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 380px", gap: mobile ? 14 : 20 }}>
-          <AgentRegistry agents={agents} onToggle={toggleAgent} loading={loading} />
-          <PolicyStudio agents={agents} />
+          <AgentRegistry agents={agents} onToggle={toggleAgent} />
+          <PolicyStudio />
         </div>
       </main>
 

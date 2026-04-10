@@ -35,3 +35,4 @@ dump.rdb
 
 # Experiment outputs
 experiments/quick_results.json
+test_connection.py

@@ -40,6 +40,11 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                 continue  # timeout, loop back
 
             async with AuditorSession() as session:
+                # NOTE: `:param::jsonb` looks natural but SQLAlchemy's text()
+                # bindparam regex uses a `(?!:)` negative lookahead, so a
+                # colon immediately after the bind name kills the match and
+                # the literal `:raw_intent` is sent to asyncpg. Use CAST()
+                # instead — functionally identical, parser-safe.
                 await session.execute(
                     text("""
                         INSERT INTO audit_logs (
@@ -48,10 +53,10 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                             denial_reason, transaction_id,
                             policy_snapshot, latency_ms, created_at
                         ) VALUES (
-                            :id, :agent_id, :raw_intent::jsonb, :projected_cost,
+                            :id, :agent_id, CAST(:raw_intent AS jsonb), :projected_cost,
                             :action_domain, :risk_score, :status,
                             :denial_reason, :transaction_id,
-                            :policy_snapshot::jsonb, :latency_ms, :created_at
+                            CAST(:policy_snapshot AS jsonb), :latency_ms, :created_at
                         )
                     """),
                     {
@@ -66,9 +71,10 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                         "transaction_id": record.get("transaction_id"),
                         "policy_snapshot": _to_json_str(record.get("policy_snapshot")),
                         "latency_ms": record.get("latency_ms"),
-                        "created_at": record.get(
-                            "created_at", datetime.now(timezone.utc).isoformat()
-                        ),
+                        # Redis payloads are JSON so created_at arrives as an
+                        # ISO-8601 string. asyncpg's timestamptz encoder wants
+                        # a real datetime; coerce before bind.
+                        "created_at": _parse_timestamp(record.get("created_at")),
                     },
                 )
                 await session.commit()
@@ -89,6 +95,26 @@ def _to_json_str(obj) -> str | None:
         return None
     import json
     return json.dumps(obj) if isinstance(obj, (dict, list)) else str(obj)
+
+
+def _parse_timestamp(value) -> datetime:
+    """Coerce a created_at payload value into a tz-aware datetime.
+
+    The queue serializes to JSON, so datetimes round-trip as ISO strings.
+    asyncpg's timestamptz encoder refuses strings, so we parse back here.
+    Unknown / missing values fall back to now() — better a slightly-wrong
+    timestamp than a lost audit row.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            # fromisoformat in 3.11+ handles trailing "Z" and offsets cleanly.
+            parsed = datetime.fromisoformat(value)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 async def main() -> None:

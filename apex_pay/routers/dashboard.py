@@ -14,17 +14,54 @@ Read-only endpoints that power the live dashboard. Uses the ReadonlySession
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, text, case, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apex_pay.core.database import ReadonlySession, GatewaySession
 from apex_pay.core.models import Agent, AuditLog, Policy, Transaction
 
+logger = logging.getLogger("apex_pay.dashboard")
+
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+# ── Shared audit-log serializer ─────────────────────────────────────────────
+# Used by both the paginated GET /audit-logs endpoint and the SSE
+# /audit-logs/stream endpoint so polled and streamed payloads have
+# byte-identical shape and the frontend can merge them blindly.
+def _serialize_audit_log(log: AuditLog, agent_name: str) -> dict:
+    raw = log.raw_intent or {}
+    return {
+        "id": str(log.id),
+        "timestamp": log.created_at.isoformat() if log.created_at else None,
+        "agentName": agent_name,
+        "agentId": str(log.agent_id),
+        "status": log.status,
+        "function": raw.get(
+            "function", raw.get("tool_call", {}).get("function", "unknown")
+        ),
+        "domain": log.action_domain or raw.get("target_url", "internal"),
+        "cost": float(log.projected_cost) if log.projected_cost else 0,
+        "riskScore": round(float(log.risk_score) * 100) if log.risk_score else 0,
+        "reason": log.denial_reason or "policy_passed",
+        "rawIntent": raw,
+        "latencyMs": float(log.latency_ms) if log.latency_ms else None,
+        "policySnapshot": log.policy_snapshot,
+    }
+
+
+# The SSE /audit-logs/stream endpoint subscribes to the
+# `audit_feed_broker` owned by the FastAPI lifespan (see apex_pay/main.py).
+# DSN translation + LISTEN lifecycle lives there — this router only reads
+# from the broker's fanout queues.
 
 
 # ── Dependencies ───────────────────────────────────────────────────────────
@@ -200,26 +237,166 @@ async def get_audit_logs(
     else:
         agent_map = {}
 
-    items = []
-    for log in logs:
-        raw = log.raw_intent or {}
-        items.append({
-            "id": str(log.id),
-            "timestamp": log.created_at.isoformat() if log.created_at else None,
-            "agentName": agent_map.get(log.agent_id, "Unknown"),
-            "agentId": str(log.agent_id),
-            "status": log.status,
-            "function": raw.get("function", raw.get("tool_call", {}).get("function", "unknown")),
-            "domain": log.action_domain or raw.get("target_url", "internal"),
-            "cost": float(log.projected_cost) if log.projected_cost else 0,
-            "riskScore": round(float(log.risk_score) * 100) if log.risk_score else 0,
-            "reason": log.denial_reason or "policy_passed",
-            "rawIntent": raw,
-            "latencyMs": float(log.latency_ms) if log.latency_ms else None,
-            "policySnapshot": log.policy_snapshot,
-        })
+    items = [
+        _serialize_audit_log(log, agent_map.get(log.agent_id, "Unknown"))
+        for log in logs
+    ]
 
     return {"items": items, "total": total}
+
+
+# ==========================================================================
+# GET /dashboard/audit-logs/stream — SSE live tail of audit_logs
+# ==========================================================================
+# Architecture:
+#   audit_logs INSERT → trigger notify_audit_insert → pg_notify('audit_feed', id)
+#   ↓
+#   ONE process-wide asyncpg LISTEN conn (apex_pay.services.audit_feed_broker)
+#   ↓
+#   fan-out to per-subscriber asyncio.Queue
+#   ↓
+#   per-notify SELECT by id (readonly session) + agent name lookup
+#   ↓
+#   SSE frame to the browser EventSource
+#
+# Design choices:
+#   • Payload on the NOTIFY channel is id-only (8KB NOTIFY cap; raw_intent
+#     could blow it). The SSE handler hydrates via SELECT on the readonly
+#     role so payload shape matches /audit-logs exactly.
+#   • The broker holds one dedicated asyncpg connection for the lifetime
+#     of the process. A per-client connection works in principle, but on
+#     Supabase's Supavisor pooler a burst of new-connection attempts trips
+#     the pooler's own circuit breaker — holding one long-lived conn
+#     sidesteps that failure mode and respects the connection cap.
+#   • 15-second heartbeat comment frames defeat reverse-proxy idle timeouts
+#     (nginx default is 60s, most CDNs 30–60s).
+#   • X-Accel-Buffering: no — nginx would otherwise buffer the response
+#     and batch-flush, defeating real-time delivery.
+#   • Backfill of the last 50 rows so a fresh tab isn't empty; frontend
+#     de-dupes by id across the backfill/live boundary.
+# ==========================================================================
+_SSE_BACKFILL_ROWS = 50
+_SSE_HEARTBEAT_SECONDS = 15.0
+
+
+async def _hydrate_audit_log(log_id: uuid.UUID) -> dict | None:
+    """Fetch one audit row + agent name and serialize to the dashboard shape."""
+    async with ReadonlySession() as s:
+        log_result = await s.execute(
+            select(AuditLog).where(AuditLog.id == log_id)
+        )
+        log = log_result.scalar_one_or_none()
+        if log is None:
+            return None
+
+        agent_q = await s.execute(
+            select(Agent.name).where(Agent.id == log.agent_id)
+        )
+        agent_name = agent_q.scalar_one_or_none() or "Unknown"
+        return _serialize_audit_log(log, agent_name)
+
+
+@router.get("/audit-logs/stream")
+async def stream_audit_logs(request: Request) -> StreamingResponse:
+    """SSE live tail of audit_logs.
+
+    Emits each new row as a `data:`-framed JSON object whose shape matches
+    `GET /audit-logs` items exactly. Backfills the last 50 rows on connect
+    so a freshly-opened tab isn't empty; the client de-dupes by id.
+    """
+    broker = getattr(request.app.state, "audit_feed_broker", None)
+    if broker is None:
+        # Unlikely: lifespan startup didn't complete. Fail the request
+        # hard so the frontend can show an offline state rather than
+        # hanging on an empty stream.
+        raise HTTPException(
+            status_code=503,
+            detail="audit feed broker not initialized",
+        )
+
+    queue = broker.subscribe()
+
+    async def event_source():
+        try:
+            # ── Backfill: last N rows so the UI isn't empty on connect ─────
+            async with ReadonlySession() as s:
+                result = await s.execute(
+                    select(AuditLog)
+                    .order_by(AuditLog.created_at.desc())
+                    .limit(_SSE_BACKFILL_ROWS)
+                )
+                backfill_rows = list(result.scalars().all())
+
+                agent_ids = list({r.agent_id for r in backfill_rows})
+                if agent_ids:
+                    agents_q = await s.execute(
+                        select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids))
+                    )
+                    agent_map = {row.id: row.name for row in agents_q.all()}
+                else:
+                    agent_map = {}
+
+            # Send oldest-first so the client renders them in chronological
+            # order (the UI prepends newer rows, so emit reversed).
+            for log in reversed(backfill_rows):
+                payload = _serialize_audit_log(
+                    log, agent_map.get(log.agent_id, "Unknown")
+                )
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            # ── Live tail (from the shared broker queue) ───────────────────
+            while True:
+                try:
+                    log_id_str = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # SSE heartbeat — comment frames (lines starting with `:`)
+                    # are silently ignored by EventSource but keep proxies
+                    # from treating the connection as idle.
+                    yield ": keepalive\n\n"
+                    continue
+
+                # The broker pushes an empty-string sentinel during shutdown
+                # to release any blocked consumers. Skip it.
+                if not log_id_str:
+                    continue
+
+                try:
+                    log_id = uuid.UUID(log_id_str)
+                except ValueError:
+                    logger.warning(
+                        "Bad audit_feed payload (not a UUID): %r", log_id_str,
+                    )
+                    continue
+
+                hydrated = await _hydrate_audit_log(log_id)
+                if hydrated is None:
+                    # Row was just inserted; if we can't find it via the
+                    # readonly role, something is badly off — log and skip.
+                    logger.warning("audit_feed notify for missing id %s", log_id)
+                    continue
+                yield f"data: {json.dumps(hydrated)}\n\n"
+
+        except asyncio.CancelledError:
+            # Normal: client disconnected.
+            raise
+        except Exception:
+            logger.exception("SSE audit-logs stream crashed; closing.")
+        finally:
+            broker.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            # Prevent any well-behaved proxy (nginx, cloudflare, etc.) from
+            # buffering the response and batching frames.
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ==========================================================================

@@ -78,8 +78,15 @@ def _build_credential_manager() -> CredentialManager:
 
 def _build_risk_classifier():
     s = settings.shield
-    if s.risk_backend == "llama-guard" and s.llama_guard_url:
-        return LlamaGuardAdapter(url=s.llama_guard_url)
+    # Accept both "llama-guard" and "llama_guard" — env files commonly
+    # normalise to one style or the other and a silent mismatch would
+    # fall through to the heuristic with no indication the SLM isn't
+    # actually being consulted.
+    backend = (s.risk_backend or "").lower().replace("_", "-")
+    if backend == "llama-guard" and s.llama_guard_url:
+        logger.info("Shield risk backend: llama-guard at %s", s.llama_guard_url)
+        return LlamaGuardAdapter(url=s.llama_guard_url, timeout=30.0)
+    logger.info("Shield risk backend: heuristic (no SLM configured)")
     return HeuristicClassifier()
 
 

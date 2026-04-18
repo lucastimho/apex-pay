@@ -9,8 +9,13 @@ import {
 import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MOCK DATA — Replace with TanStack Query calls to APEX-Pay FastAPI backend
+// API CONFIG — FastAPI backend base URL
 // ═══════════════════════════════════════════════════════════════════════════
+// Override at build time with `VITE_API_URL=https://apex.example.com npm run build`
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+// Mock agents still used as placeholders until /dashboard/agents is wired.
+// The audit feed itself comes from /dashboard/audit-logs/stream (see below).
 const MOCK_AGENTS = [
   { id: "a1", name: "GPT-Buyer", status: "active", balance: 342.18, dailySpend: 157.82, dailyLimit: 200, riskAvg: 22, txCount: 48 },
   { id: "a2", name: "Claude-Ops", status: "active", balance: 891.50, dailySpend: 42.50, dailyLimit: 500, riskAvg: 8, txCount: 15 },
@@ -18,33 +23,6 @@ const MOCK_AGENTS = [
   { id: "a4", name: "Gemini-Pay", status: "active", balance: 1250.00, dailySpend: 89.00, dailyLimit: 300, riskAvg: 31, txCount: 27 },
   { id: "a5", name: "Llama-Trade", status: "active", balance: 455.33, dailySpend: 178.67, dailyLimit: 250, riskAvg: 56, txCount: 63 },
 ];
-
-const STATUSES = ["APPROVED", "DENIED", "PENDING_REVIEW"];
-const DOMAINS = ["api.stripe.com", "api.openai.com", "api.shopify.com", "payments.google.com", "evil.example.com"];
-const FUNCTIONS = ["charge_card", "book_flight", "subscribe", "purchase_api_credits", "transfer_funds", "refund", "list_products"];
-
-function generateAuditEntry(i) {
-  const status = STATUSES[Math.random() < 0.55 ? 0 : Math.random() < 0.7 ? 1 : 2];
-  const agent = MOCK_AGENTS[Math.floor(Math.random() * MOCK_AGENTS.length)];
-  const cost = +(Math.random() * 80 + 1).toFixed(2);
-  const risk = Math.min(100, Math.max(0, Math.floor(Math.random() * 100)));
-  return {
-    id: `log-${Date.now()}-${i}`,
-    timestamp: new Date(Date.now() - Math.random() * 86400000).toISOString(),
-    agentName: agent.name,
-    agentId: agent.id,
-    status,
-    function: FUNCTIONS[Math.floor(Math.random() * FUNCTIONS.length)],
-    domain: DOMAINS[Math.floor(Math.random() * DOMAINS.length)],
-    cost,
-    riskScore: risk,
-    reason: status === "DENIED" ? (risk > 60 ? "daily_budget_exceeded" : "domain_not_allowed") : status === "PENDING_REVIEW" ? "elevated_risk_score" : "policy_passed",
-    rawIntent: { function: "charge_card", target_url: `https://${DOMAINS[Math.floor(Math.random() * DOMAINS.length)]}/v1/charges`, parameters: { amount: cost, currency: "USD" } },
-  };
-}
-
-const INITIAL_LOGS = Array.from({ length: 60 }, (_, i) => generateAuditEntry(i))
-  .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THEME TOKENS — Cyber-Noir palette
@@ -519,19 +497,47 @@ function ThroughputMini() {
 export default function APEXCommand() {
   const mobile = useIsMobile();
   const [agents, setAgents] = useState(MOCK_AGENTS);
-  const [logs, setLogs] = useState(INITIAL_LOGS);
+  const [logs, setLogs] = useState([]);
   const [selectedLog, setSelectedLog] = useState(null);
   const [now, setNow] = useState(new Date());
+  // "connecting" | "live" | "offline" — drives the LIVE badge in the header.
+  const [streamStatus, setStreamStatus] = useState("connecting");
 
-  // Simulate live feed
+  // Wall-clock tick so the header time doesn't freeze between log arrivals.
   useEffect(() => {
-    const interval = setInterval(() => {
-      const newLog = generateAuditEntry(Date.now());
-      newLog.timestamp = new Date().toISOString();
-      setLogs(prev => [newLog, ...prev].slice(0, 200));
-      setNow(new Date());
-    }, 3000);
-    return () => clearInterval(interval);
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Live audit feed via Server-Sent Events ─────────────────────────────
+  // Backend streams from /dashboard/audit-logs/stream using Postgres
+  // LISTEN/NOTIFY on audit_logs INSERTs. Backfills ~50 rows on connect,
+  // then live-tails. EventSource auto-reconnects on transient drops;
+  // de-dupe by id to handle the backfill window on reconnect.
+  useEffect(() => {
+    const es = new EventSource(`${API_URL}/dashboard/audit-logs/stream`);
+    setStreamStatus("connecting");
+
+    es.onopen = () => setStreamStatus("live");
+    es.onmessage = (ev) => {
+      let log;
+      try {
+        log = JSON.parse(ev.data);
+      } catch (e) {
+        console.warn("SSE: non-JSON frame", ev.data);
+        return;
+      }
+      setLogs(prev => {
+        if (prev.some(l => l.id === log.id)) return prev; // dedupe
+        return [log, ...prev].slice(0, 200);
+      });
+    };
+    es.onerror = () => {
+      // EventSource will auto-reconnect; surface the blip in the UI.
+      setStreamStatus(es.readyState === EventSource.CLOSED ? "offline" : "connecting");
+    };
+
+    return () => es.close();
   }, []);
 
   const toggleAgent = (id) => {
@@ -572,14 +578,28 @@ export default function APEXCommand() {
           <span style={{ fontSize: mobile ? 15 : 18, fontWeight: 800, letterSpacing: "-0.02em" }}>
             APEX<span style={{ color: T.accent }}>-Command</span>
           </span>
-          {!mobile && (
-            <Badge color={T.emerald} style={{ marginLeft: 8 }}>
-              <span style={{ animation: "pulse 2s infinite" }}>●</span> LIVE
-            </Badge>
-          )}
+          {!mobile && (() => {
+            const map = {
+              live:       { color: T.emerald, label: "LIVE",         pulse: true  },
+              connecting: { color: T.amber,   label: "CONNECTING",   pulse: true  },
+              offline:    { color: T.rose,    label: "OFFLINE",      pulse: false },
+            };
+            const s = map[streamStatus] || map.connecting;
+            return (
+              <Badge color={s.color} style={{ marginLeft: 8 }}>
+                <span style={{ animation: s.pulse ? "pulse 2s infinite" : "none" }}>●</span> {s.label}
+              </Badge>
+            );
+          })()}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: mobile ? 6 : 12, fontSize: 12, color: T.textDim }}>
-          {mobile && <span style={{ color: T.emerald, animation: "pulse 2s infinite", fontSize: 10 }}>●</span>}
+          {mobile && (
+            <span style={{
+              color: streamStatus === "live" ? T.emerald : streamStatus === "offline" ? T.rose : T.amber,
+              animation: streamStatus === "offline" ? "none" : "pulse 2s infinite",
+              fontSize: 10,
+            }}>●</span>
+          )}
           <Clock size={14} />
           {now.toLocaleTimeString()}
         </div>

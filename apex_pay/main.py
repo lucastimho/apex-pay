@@ -31,6 +31,7 @@ from slowapi.util import get_remote_address
 from apex_pay.core.config import settings
 from apex_pay.core.database import dispose_engines
 from apex_pay.routers import admin, dashboard, gateway, hitl
+from apex_pay.services.audit_feed_broker import AuditFeedBroker
 from apex_pay.services.audit_queue import AuditQueue
 from apex_pay.workers.audit_worker import drain_audit_queue
 
@@ -68,6 +69,17 @@ async def lifespan(app: FastAPI):
     # Launch background audit worker
     worker_task = asyncio.create_task(drain_audit_queue(audit_queue))
 
+    # ── Audit feed broker (LISTEN/NOTIFY → SSE) ──────────────────────────
+    # One connection for the whole process, shared across all /audit-logs/stream
+    # subscribers. Translating the SQLAlchemy DSN: asyncpg.connect() doesn't
+    # accept the `+asyncpg` driver hint.
+    audit_feed_dsn = settings.db.readonly_dsn.replace(
+        "postgresql+asyncpg://", "postgresql://", 1,
+    )
+    audit_feed_broker = AuditFeedBroker(dsn=audit_feed_dsn)
+    await audit_feed_broker.start()
+    app.state.audit_feed_broker = audit_feed_broker
+
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────
@@ -77,6 +89,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    await audit_feed_broker.stop()
     await audit_queue.close()
     await dispose_engines()
     logger.info("APEX-Pay shut down cleanly.")

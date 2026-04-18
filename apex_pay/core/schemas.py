@@ -71,12 +71,22 @@ class GatewayResponse(BaseModel):
 
     request_id: uuid.UUID
     allowed: bool
-    status: str  # "APPROVED" | "DENIED" | "ERROR"
+    status: str  # "APPROVED" | "DENIED" | "ERROR" | "ESCALATED"
     reason: str
     transaction_id: uuid.UUID | None = None
     token: str | None = None
     token_expiry: datetime | None = None
     latency_ms: float | None = None
+
+    # ── APEX-Shield additions ──────────────────────────────────────────
+    intent_hash: str | None = None
+    ephemeral_credential: str | None = None   # scoped, short-lived token
+    credential_token_id: str | None = None    # opaque handle, safe to log
+    receipt: dict[str, Any] | None = None     # signed execution receipt
+    risk_score: float | None = None
+    risk_entropy: float | None = None
+    violations: list[str] = Field(default_factory=list)
+    hitl_request_id: uuid.UUID | None = None  # set when status == ESCALATED
 
 
 # ── Challenge (HTTP 402) ────────────────────────────────────────────────────

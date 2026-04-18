@@ -67,8 +67,15 @@ class AuditQueue:
         transaction_id: uuid.UUID | None = None,
         policy_snapshot: dict[str, Any] | None = None,
         latency_ms: float | None = None,
+        intent_hash: str | None = None,
+        receipt: dict[str, Any] | None = None,
     ) -> None:
-        """Serialize and push an audit record onto the Redis queue."""
+        """Serialize and push an audit record onto the Redis queue.
+
+        `intent_hash` and `receipt` are Shield additions; they are dropped
+        on the floor by pre-migration deployments because the audit worker
+        only references them when the columns exist.
+        """
         if self._redis is None:
             return  # graceful degradation when Redis unavailable
 
@@ -84,6 +91,8 @@ class AuditQueue:
             "transaction_id": str(transaction_id) if transaction_id else None,
             "policy_snapshot": policy_snapshot,
             "latency_ms": latency_ms,
+            "intent_hash": intent_hash,
+            "receipt": receipt,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await self._redis.rpush(self._queue, json.dumps(record))

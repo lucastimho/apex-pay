@@ -38,10 +38,15 @@ from apex_pay.core.schemas import (
 from apex_pay.services.audit_queue import AuditQueue
 from apex_pay.services.policy_engine import PolicyEngine
 from apex_pay.services.token_service import TokenService
+from apex_pay.shield.factory import build_shield_pipeline
+from apex_pay.shield.hitl_store import default_store as default_hitl_store
+from apex_pay.shield.intent import canonicalize_intent
+from apex_pay.shield.pipeline import PolicySnapshot, ShieldDecision
 
 router = APIRouter()
 policy_engine = PolicyEngine()
 token_service = TokenService()
+shield_pipeline = build_shield_pipeline() if settings.shield.enabled else None
 
 _start_time = time.time()
 
@@ -87,7 +92,10 @@ async def execute_tool_call(
             detail="Audit queue saturated — retry later.",
         )
 
-    # ── Logfire: trace the intent ──────────────────────────────────────
+    # ── Legacy policy engine: loads agent/policy/spend from DB ─────────
+    # We keep running it for the allow path so the shield stays stateless
+    # and the /execute contract still reflects daily-spend math even when
+    # the shield is disabled.
     with logfire.span(
         "policy_evaluation",
         agent_id=str(payload.agent_id),
@@ -95,28 +103,98 @@ async def execute_tool_call(
     ):
         decision: PolicyDecision = await policy_engine.evaluate(payload, session)
 
+    # ── APEX-Shield: semantic risk + OPA + credential + receipt ────────
+    shield_decision: ShieldDecision | None = None
+    if shield_pipeline is not None:
+        intent = canonicalize_intent(payload.agent_id, payload.tool_call)
+        # Build policy snapshot for OPA. When the legacy policy_engine said
+        # "no policy / bad agent", fall back to zero-limits so OPA denies.
+        snap_dict = decision.policy_snapshot or {}
+        policy_snap = PolicySnapshot(
+            max_per_transaction=float(snap_dict.get("max_per_transaction", 0.0)),
+            daily_limit=float(snap_dict.get("daily_limit", 0.0)),
+            allowed_domains=list(snap_dict.get("allowed_domains", []) or []),
+            spent_today=0.0,  # legacy engine already enforced cumulative math
+        )
+        shield_decision = await shield_pipeline.evaluate(
+            intent=intent, policy=policy_snap,
+        )
+
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    # ── Build response ─────────────────────────────────────────────────
-    status = "APPROVED" if decision.allowed else "DENIED"
+    # ── Combine both layers: deny if either says deny ──────────────────
+    allowed = decision.allowed
+    reason = decision.reason
+    status = "APPROVED" if allowed else "DENIED"
+    violations: list[str] = []
+    hitl_id: uuid.UUID | None = None
 
+    if shield_decision is not None:
+        violations = list(shield_decision.violations)
+        if shield_decision.escalate and decision.allowed:
+            # Shield wants a human; legacy said ok. Route to HITL.
+            hitl_req = await default_hitl_store().create(
+                agent_id=payload.agent_id,
+                intent_hash=shield_decision.intent.intent_hash,
+                reason=shield_decision.reason,
+                violations=violations,
+                opa_input=shield_decision.policy_snapshot,
+                risk_score=shield_decision.risk.score,
+                risk_entropy=shield_decision.risk.entropy,
+            )
+            hitl_id = hitl_req.id
+            allowed = False
+            reason = shield_decision.reason
+            status = "ESCALATED"
+        elif not shield_decision.allow and decision.allowed:
+            # Legacy said ok, shield said no → surface the shield's reason.
+            allowed = False
+            reason = shield_decision.reason
+            status = "DENIED"
+        # If legacy already denied, keep the legacy reason; the shield's
+        # follow-on deny is redundant (and may be a zero-policy artefact).
+
+    # ── Build response ─────────────────────────────────────────────────
     response = GatewayResponse(
         request_id=request_id,
-        allowed=decision.allowed,
+        allowed=allowed,
         status=status,
-        reason=decision.reason,
+        reason=reason,
         latency_ms=round(elapsed_ms, 2),
+        violations=violations,
+        intent_hash=shield_decision.intent.intent_hash if shield_decision else None,
+        risk_score=shield_decision.risk.score if shield_decision else None,
+        risk_entropy=shield_decision.risk.entropy if shield_decision else None,
+        hitl_request_id=hitl_id,
     )
 
+    if allowed and shield_decision is not None:
+        if shield_decision.credential is not None:
+            response.ephemeral_credential = shield_decision.credential.token
+            response.credential_token_id = shield_decision.credential.token_id
+            response.token = shield_decision.credential.token
+            response.token_expiry = datetime.fromtimestamp(
+                shield_decision.credential.expires_at, tz=timezone.utc,
+            )
+        if shield_decision.receipt is not None:
+            response.receipt = shield_decision.receipt.to_dict()
+
     # ── Async audit log (non-blocking) ─────────────────────────────────
+    # Use the shield's risk score (richer) when available. Note: the
+    # AuditLog schema constrains status IN (APPROVED, DENIED, ERROR);
+    # "ESCALATED" is normalised to DENIED in the log but carries the
+    # specific reason so analysts can distinguish them.
+    audit_status = status if status in ("APPROVED", "DENIED") else "DENIED"
     await audit_queue.push(
         agent_id=payload.agent_id,
         raw_intent=payload.tool_call,
         projected_cost=decision.projected_cost,
         action_domain=decision.action_domain,
-        risk_score=decision.risk_score,
-        status=status,
-        denial_reason=decision.reason if not decision.allowed else None,
+        risk_score=(
+            shield_decision.risk.score if shield_decision else decision.risk_score
+        ),
+        status=audit_status,
+        denial_reason=reason if not allowed else None,
         policy_snapshot=decision.policy_snapshot,
         latency_ms=round(elapsed_ms, 2),
     )
@@ -126,9 +204,11 @@ async def execute_tool_call(
         "Policy decision: {status} for agent {agent_id} — {reason}",
         status=status,
         agent_id=str(payload.agent_id),
-        reason=decision.reason,
+        reason=reason,
         latency_ms=round(elapsed_ms, 2),
         projected_cost=decision.projected_cost,
+        intent_hash=response.intent_hash,
+        violations=violations,
     )
 
     return response
@@ -359,6 +439,30 @@ async def reset_ledger(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(text("DELETE FROM transactions"))
     await session.commit()
     return {"status": "ok", "message": "Ledger cleared."}
+
+
+# =============================================================================
+# POST /shield/verify-receipt — Third-party receipt verification
+# =============================================================================
+@router.post("/shield/verify-receipt", tags=["shield"])
+async def verify_receipt(body: dict) -> dict:
+    """Verify a signed execution receipt against the gateway's keyring.
+
+    Third parties (downstream APIs, auditors) can POST {receipt, signature, kid}
+    here and get back {valid, reason}. This does not touch the DB; the
+    signature is self-contained.
+    """
+    if shield_pipeline is None:
+        raise HTTPException(status_code=503, detail="Shield is disabled on this gateway.")
+
+    from apex_pay.shield.receipt_service import SignedReceipt
+    try:
+        signed = SignedReceipt.from_dict(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Malformed receipt: {exc}")
+
+    ok, reason = shield_pipeline.receipts.verify(signed)
+    return {"valid": ok, "reason": reason}
 
 
 # =============================================================================

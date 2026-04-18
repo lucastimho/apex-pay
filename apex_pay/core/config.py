@@ -75,6 +75,51 @@ class _LogfireSettings(BaseSettings):
     environment: str = "development"
 
 
+class _ShieldSettings(BaseSettings):
+    """APEX-Shield zero-trust layer configuration.
+
+    Every field has a safe default so the shield is active out-of-the-box:
+    embedded OPA evaluator, dev credential backend, heuristic risk filter,
+    and an ephemeral Ed25519 key. Override in production.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="SHIELD_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    policy_version: str = "2026.04.17"
+
+    # OPA sidecar. Empty = embedded Python evaluator only.
+    opa_url: str = ""
+    opa_timeout_seconds: float = 2.0
+
+    # Risk filter. "heuristic" (default) or "llama-guard".
+    risk_backend: str = "heuristic"
+    llama_guard_url: str = ""
+
+    # Decision thresholds.
+    risk_block_threshold: float = 0.80
+    risk_escalate_threshold: float = 0.40
+    entropy_escalate_threshold: float = 0.65
+
+    # Credential backend: "dev" or "vault".
+    credential_backend: str = "dev"
+    ephemeral_ttl_seconds: int = 60
+    ephemeral_ttl_max_seconds: int = 300
+
+    # Vault (only read when credential_backend == "vault").
+    vault_addr: str = ""
+    vault_role_id: str = ""
+    vault_secret_id: str = ""
+    vault_secrets_path: str = "database/creds/apex-gateway"
+    vault_wrap_ttl: str = "60s"
+
+    # Ed25519 signing keys.
+    ed25519_kid: str = "key-ephemeral"
+    ed25519_private_b64: str = ""
+    # Map of kid -> base64 Raw public key, for multi-key verification.
+    ed25519_public_keys_json: str = ""
+
+
 class Settings(BaseSettings):
     """Root settings object — compose all sub-configs."""
 
@@ -92,6 +137,7 @@ class Settings(BaseSettings):
     security: _SecuritySettings = _SecuritySettings()
     rate_limit: _RateLimitSettings = _RateLimitSettings()
     logfire: _LogfireSettings = _LogfireSettings()
+    shield: _ShieldSettings = _ShieldSettings()
 
 
 # Singleton – import `settings` everywhere.

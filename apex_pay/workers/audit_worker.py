@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from apex_pay.core.config import settings
 from apex_pay.core.database import AuditorSession
@@ -45,39 +46,58 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                 # colon immediately after the bind name kills the match and
                 # the literal `:raw_intent` is sent to asyncpg. Use CAST()
                 # instead — functionally identical, parser-safe.
-                await session.execute(
-                    text("""
-                        INSERT INTO audit_logs (
-                            id, agent_id, raw_intent, projected_cost,
-                            action_domain, risk_score, status,
-                            denial_reason, transaction_id,
-                            policy_snapshot, latency_ms, created_at
-                        ) VALUES (
-                            :id, :agent_id, CAST(:raw_intent AS jsonb), :projected_cost,
-                            :action_domain, :risk_score, :status,
-                            :denial_reason, :transaction_id,
-                            CAST(:policy_snapshot AS jsonb), :latency_ms, :created_at
+                try:
+                    await session.execute(
+                        text("""
+                            INSERT INTO audit_logs (
+                                id, agent_id, raw_intent, projected_cost,
+                                action_domain, risk_score, status,
+                                denial_reason, transaction_id,
+                                policy_snapshot, latency_ms, created_at,
+                                intent_hash, receipt
+                            ) VALUES (
+                                :id, :agent_id, CAST(:raw_intent AS jsonb), :projected_cost,
+                                :action_domain, :risk_score, :status,
+                                :denial_reason, :transaction_id,
+                                CAST(:policy_snapshot AS jsonb), :latency_ms, :created_at,
+                                :intent_hash, CAST(:receipt AS jsonb)
+                            )
+                        """),
+                        {
+                            "id": record.get("id", str(uuid.uuid4())),
+                            "agent_id": record["agent_id"],
+                            "raw_intent": _to_json_str(record["raw_intent"]),
+                            "projected_cost": record.get("projected_cost"),
+                            "action_domain": record.get("action_domain"),
+                            "risk_score": record.get("risk_score", 0.0),
+                            "status": record["status"],
+                            "denial_reason": record.get("denial_reason"),
+                            "transaction_id": record.get("transaction_id"),
+                            "policy_snapshot": _to_json_str(record.get("policy_snapshot")),
+                            "latency_ms": record.get("latency_ms"),
+                            # Redis payloads are JSON so created_at arrives as an
+                            # ISO-8601 string. asyncpg's timestamptz encoder wants
+                            # a real datetime; coerce before bind.
+                            "created_at": _parse_timestamp(record.get("created_at")),
+                            "intent_hash": record.get("intent_hash"),
+                            "receipt": _to_json_str(record.get("receipt")),
+                        },
+                    )
+                    await session.commit()
+                except IntegrityError as exc:
+                    # Dedup index (migration 003) collapsed a retry of the
+                    # same (intent_hash, agent_id, minute) onto an existing
+                    # row. At-least-once delivery means this is expected; ack
+                    # the redis pop and move on.
+                    await session.rollback()
+                    if _is_unique_violation(exc):
+                        logger.debug(
+                            "Audit record dedup hit for id=%s intent_hash=%s",
+                            record.get("id"),
+                            record.get("intent_hash"),
                         )
-                    """),
-                    {
-                        "id": record.get("id", str(uuid.uuid4())),
-                        "agent_id": record["agent_id"],
-                        "raw_intent": _to_json_str(record["raw_intent"]),
-                        "projected_cost": record.get("projected_cost"),
-                        "action_domain": record.get("action_domain"),
-                        "risk_score": record.get("risk_score", 0.0),
-                        "status": record["status"],
-                        "denial_reason": record.get("denial_reason"),
-                        "transaction_id": record.get("transaction_id"),
-                        "policy_snapshot": _to_json_str(record.get("policy_snapshot")),
-                        "latency_ms": record.get("latency_ms"),
-                        # Redis payloads are JSON so created_at arrives as an
-                        # ISO-8601 string. asyncpg's timestamptz encoder wants
-                        # a real datetime; coerce before bind.
-                        "created_at": _parse_timestamp(record.get("created_at")),
-                    },
-                )
-                await session.commit()
+                    else:
+                        raise
 
             logger.debug("Persisted audit record %s", record.get("id"))
 
@@ -95,6 +115,14 @@ def _to_json_str(obj) -> str | None:
         return None
     import json
     return json.dumps(obj) if isinstance(obj, (dict, list)) else str(obj)
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """Return True if the IntegrityError is a Postgres 23505 (unique_violation)."""
+    orig = getattr(exc, "orig", None)
+    # asyncpg wraps the SQLSTATE on the original exception.
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return sqlstate == "23505"
 
 
 def _parse_timestamp(value) -> datetime:

@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     transaction_id  UUID,                                   -- Populated after downstream settlement
     policy_snapshot JSONB,                                  -- Frozen copy of policy at decision time
     latency_ms      NUMERIC(10, 2),                         -- Round-trip decision latency
+    intent_hash     TEXT,                                   -- SHA-256 of canonical intent (shield)
+    receipt         JSONB,                                  -- Ed25519 signed receipt (shield)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -86,6 +88,14 @@ CREATE INDEX idx_audit_status    ON audit_logs (status);
 CREATE INDEX idx_audit_created   ON audit_logs (created_at);
 CREATE INDEX idx_audit_agent_day ON audit_logs (agent_id, created_at)
     WHERE status = 'APPROVED';                              -- Fast daily-spend aggregation
+CREATE INDEX IF NOT EXISTS idx_audit_intent_hash
+    ON audit_logs (intent_hash) WHERE intent_hash IS NOT NULL;
+
+-- Exactly-once audit dedup (migration 003). At-least-once delivery from the
+-- Redis queue is collapsed via (intent_hash, agent_id, minute-bucket).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_logs_dedup
+    ON audit_logs (intent_hash, agent_id, date_trunc('minute', created_at))
+    WHERE intent_hash IS NOT NULL;
 
 -- =============================================================================
 -- TABLE: transactions

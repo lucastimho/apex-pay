@@ -23,12 +23,18 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
 
 - **Zero-trust pipeline** — canonicalize → risk filter → OPA → credential → receipt, fail-closed at every stage.
 - **Least-privilege Postgres roles** — three separate database connections (`apex_gateway`, `apex_auditor`, `apex_readonly`) so the write path can't read and the read path can't write.
-- **Append-only audit log** — role-enforced INSERT-only access, plus a `pg_notify` trigger that streams every decision to subscribed dashboards in real time.
+- **Append-only audit log, exactly-once** — role-enforced INSERT-only access, write-once trigger, and a `(intent_hash, agent_id, minute-bucket)` dedup index that collapses at-least-once delivery retries into one row.
+- **Atomic balance debit on `/pay`** — `SELECT ... FOR UPDATE` locks the agent row, verifies balance, decrements, and flips the transaction state in one DB transaction so a mid-flight crash can never double-spend or issue an unpaid token.
 - **Live Nerve Center dashboard** — a React single-page app with a Server-Sent Events feed backed by a shared `LISTEN` broker; sub-100ms tail latency from decision to pixel.
-- **Cryptographically non-repudiable** — Ed25519 signed receipts bound to content-addressable intent hashes.
+- **Cryptographically non-repudiable** — Ed25519 signed receipts bound to content-addressable intent hashes, with a public **JWKS endpoint** (`/.well-known/apex-jwks`) so third parties can verify offline without a shared secret.
 - **HITL escalation** — high-entropy risk classifier outputs route to a human-review queue instead of guessing.
-- **OPA + Python fallback** — Rego as the source of truth, with an embedded Python mirror of the same rules so the sidecar being unreachable can never open the deny path.
-- **138 tests, all green.** Unit + integration coverage across every Shield component.
+- **OPA + Python fallback** — Rego as the source of truth, with an embedded Python mirror of the same rules so the sidecar being unreachable can never open the deny path. Fallback rate is exported as a Prometheus counter for alerting.
+- **Production-grade observability** — Prometheus `/metrics` (decision/latency/queue/risk/OPA-fallback/HITL gauges), split `/health` vs `/ready` probes, and a correlation-id middleware that stamps `X-Request-ID` across every log, span, and audit row.
+- **Per-agent rate limiting** — request keys resolve header → cert CN → IP, so one runaway agent can't starve its neighbours behind a shared egress NAT.
+- **Policy cache with pub/sub invalidation** — in-process TTL cache keeps the hot path off Postgres; admin edits publish on `apex.policies.invalidate` so peer replicas evict within milliseconds. SQLAlchemy ORM events catch direct-DB edits as a safety net.
+- **Opt-in replay protection + body signing** — nonce/timestamp guard backed by Redis `SET NX`, plus Ed25519 signature verification against each agent's registered public key. Both feature-flagged so agent SDKs can adopt at their own pace.
+- **Monthly partitioning playbook** — migration 004 ships an opt-in `audit_logs_partitioned` table plus `apex_create_audit_partition(year, month)` helper and a documented swap procedure for v3 scale.
+- **138 tests, all green.** Unit + integration coverage across every Shield component, with OPA/Python parity fixtures that catch Rego drift in CI.
 
 ---
 
@@ -37,17 +43,19 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
 ```
                             Agent (LLM + tools)
                                     │
-                                    ▼  POST /execute
-                        ┌───────────────────────────┐
-                        │   APEX-Pay FastAPI        │
-                        │   SlowAPI rate limiter    │
-                        └──────────────┬────────────┘
+                                    ▼  POST /execute  (optionally Ed25519-signed body)
+                        ┌───────────────────────────────┐
+                        │  FastAPI + CorrelationID MW   │
+                        │  SlowAPI (per-agent key)      │
+                        │  ReplayGuard  (Redis SET NX)  │  ← feature-flagged
+                        │  BodySignature verifier       │  ← feature-flagged
+                        └──────────────┬────────────────┘
                                        │
                                        ▼
-                        ┌───────────────────────────┐
-                        │   Legacy policy engine    │   per-tx + daily
-                        │   (budget math)           │   limits + domains
-                        └──────────────┬────────────┘
+                        ┌───────────────────────────────┐
+                        │   Legacy policy engine        │   per-tx + daily
+                        │   PolicyCache (TTL + pub/sub) │   limits + domains
+                        └──────────────┬────────────────┘
                                        │
                                        ▼
                 ┌──────────────────────────────────────────┐
@@ -66,12 +74,15 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
                                ▼                ▼
                         GatewayResponse   HITLStore  (human review)
                                │
+                               │  (on /pay only) agent row SELECT FOR UPDATE
+                               │  → verify balance → decrement → SETTLED
+                               │
                                ▼
-                      AuditQueue (Redis RPUSH)
+                      AuditQueue (Redis RPUSH, back-pressure → 503)
                                │
                   ┌────────────┘
                   ▼
-           AuditWorker (async drain)
+           AuditWorker (async drain, IntegrityError-tolerant for dedup)
                   │
                   ▼  INSERT audit_logs  (apex_auditor role, INSERT-only)
            Postgres ───────────────────► AFTER INSERT TRIGGER
@@ -81,6 +92,11 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
                                               │ fanout via asyncio.Queue
                                               ▼
                                     SSE clients (React dashboard)
+
+    Side channels:
+      • /metrics  → Prometheus scrape (decisions, latency, queue depth, risk hist)
+      • /ready    → deep readiness (DB + Redis + OPA + broker)
+      • /.well-known/apex-jwks → Ed25519 public keys for third-party verification
 ```
 
 ---
@@ -93,11 +109,11 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
 | Async runtime         | uvicorn + asyncio + asyncpg                   |
 | ORM                   | SQLAlchemy 2.0 async                          |
 | Database              | PostgreSQL (Supabase-compatible)              |
-| Cache / queue         | Redis 7 (async, hiredis)                      |
+| Cache / queue         | Redis 7 (async, hiredis) — audit queue, policy pub/sub, replay-nonce store |
 | Policy engine         | Open Policy Agent + embedded Python fallback  |
-| Cryptography          | Ed25519 (PyNaCl / cryptography)               |
-| Observability         | Pydantic Logfire (OTel-compatible)            |
-| Rate limiting         | SlowAPI                                       |
+| Cryptography          | Ed25519 (cryptography), HMAC-SHA256           |
+| Observability         | Pydantic Logfire (OTel) + Prometheus client   |
+| Rate limiting         | SlowAPI (per-agent key-func)                  |
 | Real-time stream      | PostgreSQL LISTEN/NOTIFY + SSE                |
 | Frontend              | React 19, Vite 8, Tailwind, Recharts          |
 | Tests                 | pytest + pytest-asyncio (138 passing)         |
@@ -144,6 +160,8 @@ Create three least-privilege roles and load the schema. The `schema.sql` file se
 psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -f migrations/001_shield_hardening.sql
 psql "$DATABASE_URL" -f migrations/002_audit_notify.sql
+psql "$DATABASE_URL" -f migrations/003_audit_dedup.sql
+# migration 004 is OPT-IN for v3 scale — see its header for the cutover procedure.
 
 # Verify all three triggers are present:
 psql "$DATABASE_URL" -c "
@@ -232,14 +250,18 @@ All three will appear in the dashboard's Live Nerve Center feed within ~100ms.
 
 ### Gateway
 
-| Method | Path                          | Purpose                                                       |
-| ------ | ----------------------------- | ------------------------------------------------------------- |
-| POST   | `/execute`                    | Main entry point. Intent → policy → decision + receipt.       |
-| GET    | `/data`                       | Protected data endpoint — 402 challenge / bearer-token flow.  |
-| POST   | `/pay`                        | Settle a 402 challenge and receive a signed token.            |
-| POST   | `/shield/verify-receipt`      | Offline verification of an Ed25519 execution receipt.         |
-| GET    | `/health`                     | Liveness.                                                     |
-| POST   | `/reset`                      | Clear ledger (dev only).                                      |
+| Method | Path                          | Purpose                                                           |
+| ------ | ----------------------------- | ----------------------------------------------------------------- |
+| POST   | `/execute`                    | Main entry point. Intent → policy → decision + receipt.           |
+| GET    | `/data`                       | Protected data endpoint — 402 challenge / bearer-token flow.      |
+| POST   | `/pay`                        | Settle a 402 challenge, atomic balance debit, signed token.       |
+| POST   | `/shield/verify-receipt`      | Offline verification of an Ed25519 execution receipt (JSON body). |
+| GET    | `/shield/verify-receipt`      | Same verification via `?receipt=<b64url>` — cache/CDN-friendly.   |
+| GET    | `/.well-known/apex-jwks`      | RFC 7517 JWKS for the current & rotating Ed25519 public keys.     |
+| GET    | `/health`                     | Liveness.                                                         |
+| GET    | `/ready`                      | Readiness — deep-checks DB, Redis, OPA, audit-feed broker.        |
+| GET    | `/metrics`                    | Prometheus scrape target.                                         |
+| POST   | `/reset`                      | Clear ledger (dev only).                                          |
 
 ### Dashboard
 
@@ -266,19 +288,24 @@ All three will appear in the dashboard's Live Nerve Center feed within ~100ms.
 
 All configuration is environment-driven via `pydantic-settings`. The `.env.example` is checked in with safe placeholders; copy it to `.env` before running anything.
 
-| Variable                          | Purpose                                                            |
-| --------------------------------- | ------------------------------------------------------------------ |
-| `DB_GATEWAY_DSN`                  | Read/write session. Role: `apex_gateway`.                          |
-| `DB_AUDITOR_DSN`                  | INSERT-only, for the audit worker. Role: `apex_auditor`.           |
-| `DB_READONLY_DSN`                 | SELECT-only, for dashboards and the LISTEN broker.                 |
-| `REDIS_URL`                       | Audit queue backing store.                                         |
-| `REDIS_MAX_QUEUE_DEPTH`           | Back-pressure threshold — 503 is returned when exceeded.           |
-| `SECURITY_HMAC_SECRET_KEY`        | Payment-token signing key. 64-char hex.                            |
-| `SHIELD_ED25519_PRIVATE_B64`      | Base64 Ed25519 private key for execution receipts. Generate fresh. |
-| `SHIELD_OPA_URL`                  | OPA sidecar HTTP endpoint. Leave empty to use Python fallback.     |
-| `SHIELD_RISK_FILTER_URL`          | Optional Llama-Guard-compatible semantic risk classifier.          |
-| `RATELIMIT_DEFAULT`               | Global SlowAPI default (e.g. `60/minute`).                         |
-| `LOGFIRE_TOKEN`                   | Pydantic Logfire — empty = console only.                           |
+| Variable                             | Purpose                                                                |
+| ------------------------------------ | ---------------------------------------------------------------------- |
+| `DB_GATEWAY_DSN`                     | Read/write session. Role: `apex_gateway`.                              |
+| `DB_AUDITOR_DSN`                     | INSERT-only, for the audit worker. Role: `apex_auditor`.               |
+| `DB_READONLY_DSN`                    | SELECT-only, for dashboards and the LISTEN broker.                     |
+| `REDIS_URL`                          | Audit queue, policy pub/sub, and (if enabled) replay-nonce store.      |
+| `REDIS_MAX_QUEUE_DEPTH`              | Audit-queue back-pressure threshold — 503 is returned when exceeded.   |
+| `SECURITY_HMAC_SECRET_KEY`           | Payment-token signing key. 64-char hex.                                |
+| `SECURITY_REQUIRE_NONCE`             | **Feature flag** (default `false`). Enforce nonce + issued_at window.  |
+| `SECURITY_NONCE_TTL_SECONDS`         | Replay-protection window. Also bounds clock skew. Default 300 s.       |
+| `SECURITY_REQUIRE_BODY_SIGNATURE`    | **Feature flag** (default `false`). Require Ed25519-signed request bodies. |
+| `SHIELD_ED25519_PRIVATE_B64`         | Base64 Ed25519 private key for execution receipts. Generate fresh.     |
+| `SHIELD_ED25519_PUBLIC_KEYS_JSON`    | `{kid: b64pub}` verification map. Enables zero-downtime key rotation.  |
+| `SHIELD_OPA_URL`                     | OPA sidecar HTTP endpoint. Leave empty to use Python fallback.         |
+| `SHIELD_RISK_FILTER_URL`             | Optional Llama-Guard-compatible semantic risk classifier.              |
+| `RATELIMIT_DEFAULT`                  | Per-IP SlowAPI default (e.g. `60/minute`).                             |
+| `RATELIMIT_PER_AGENT`                | Per-agent ceiling when `X-APEX-Agent-ID` is present (e.g. `30/minute`). |
+| `LOGFIRE_TOKEN`                      | Pydantic Logfire — empty = console only.                               |
 
 ---
 
@@ -334,7 +361,44 @@ Anyone — including third-party auditors — can verify the receipt against the
 
 ### Fail-closed OPA
 
-The Rego policy is the source of truth. If the OPA sidecar is unreachable, APEX-Shield evaluates the same rules via an embedded Python mirror of `apex.rego`. The fallback path only ever produces the same or a stricter decision — it cannot accidentally approve what OPA would deny.
+The Rego policy is the source of truth. If the OPA sidecar is unreachable, APEX-Shield evaluates the same rules via an embedded Python mirror of `apex.rego`. The fallback path only ever produces the same or a stricter decision — it cannot accidentally approve what OPA would deny. Every fallback increments `apex_opa_fallback_total`; alert when the rate crosses ~1% to catch sidecar flapping early.
+
+---
+
+## Production hardening
+
+The codebase follows a formal backend blueprint ([`docs/BACKEND_BLUEPRINT.md`](docs/BACKEND_BLUEPRINT.md)) modelled on the donnemartin system-design-primer conventions: use cases → back-of-envelope → high-level → core components → CAP trade-offs → scale → security → observability → deploy. The blueprint calls out which subsystem is CP, which is AP, and where back-pressure propagates; the implementation matches.
+
+### Hot-path correctness
+
+- **Atomic money math** — `/pay` opens a `SELECT ... FOR UPDATE` on the agent row, verifies `current_balance ≥ amount`, decrements, and flips the transaction to `SETTLED` in one DB transaction. Insufficient balance is an explicit `DENIED` reason, not a 500. A mid-flight crash leaves the ledger in a consistent state; there is no window in which a token is issued without the corresponding debit.
+- **Exactly-once audit** — at-least-once delivery from the Redis queue is collapsed at the DB with a partial unique index on `(intent_hash, agent_id, date_trunc('minute', created_at))`. The audit worker catches `IntegrityError` (SQLSTATE 23505) and treats it as success, so retries after a worker crash can't pollute dashboards or billing analytics.
+- **Idempotent `/pay`** — `(agent_id, idempotency_key)` uniqueness plus a cache of the original receipt means a retried settlement returns the same token and never double-debits.
+
+### Observability
+
+- **Prometheus `/metrics`** exports:
+  - `apex_decision_total{status}` — APPROVED / DENIED / ESCALATED / ERROR counts
+  - `apex_decision_latency_seconds` histogram, plus per-stage `apex_decision_stage_latency_seconds{stage}`
+  - `apex_risk_score` — distribution, for threshold tuning
+  - `apex_opa_fallback_total` — sidecar-health proxy
+  - `apex_audit_queue_depth` — sampled on scrape, drives back-pressure alerts
+  - `apex_audit_backpressure_total`, `apex_replay_rejections_total{reason}`, `apex_signature_rejections_total{reason}`, `apex_hitl_pending`
+- **Correlation IDs** — every request is stamped with an `X-Request-ID` (minted or propagated from the edge), stored in a contextvar, echoed on the response, and attached to every Logfire span, unhandled-exception log, and audit row. One trace spans edge → gateway → shield stages → DB → SSE.
+- **Deep readiness** — `/ready` runs a trivial query on the gateway DSN, an LLEN on Redis, a no-op OPA evaluation, and a liveness check on the audit-feed broker. Returns 503 when any of them are down, so k8s / ALB pulls the replica out of rotation without killing it.
+
+### Performance & scale
+
+- **Policy cache (cache-aside, TTL + pub/sub)** — the active policy snapshot per `agent_id` is memoized in-process for `~5 s`. Admin policy edits publish on `apex.policies.invalidate` so peer replicas evict synchronously; a SQLAlchemy ORM `after_update` listener covers code paths that bypass the admin router. Redis going down degrades to TTL-only — safe, not fatal.
+- **Per-agent rate limit** — SlowAPI's key function resolves `X-APEX-Agent-ID` → `X-Client-Cert-CN` → remote IP. One misbehaving agent burns its own quota, not its neighbours'. Both `RATELIMIT_DEFAULT` and `RATELIMIT_PER_AGENT` apply; the stricter governs.
+- **Partitioning playbook** — [`migrations/004_audit_partitioning.sql`](migrations/004_audit_partitioning.sql) ships an opt-in `audit_logs_partitioned` table with the same schema and write-once enforcement, plus an `apex_create_audit_partition(year, month)` helper for pg_cron, and a documented swap procedure that keeps the existing table as a safety net. Fresh installs can adopt partitioning from day one; live systems cut over in a maintenance window.
+
+### Security depth
+
+- **Third-party receipt verification** — `/.well-known/apex-jwks` publishes every active Ed25519 public key in RFC 7517 format with `kty=OKP`, `crv=Ed25519`. Verifiers pin on `kid` and rotate without a flag day: an old key stays in the JWKS map until all receipts signed with it expire. Receipts are also verifiable via `GET /shield/verify-receipt?receipt=<b64url>` for caches, CDNs, and shell-script verifiers.
+- **Opt-in request-envelope hardening** (`SECURITY_REQUIRE_NONCE`, `SECURITY_REQUIRE_BODY_SIGNATURE`) — both default OFF so existing callers keep working. When enabled:
+  - `ReplayGuard` uses Redis `SET NX` with a TTL equal to the replay window, so the nonce claim is atomic. Requests with reused nonces or out-of-window `issued_at` get a 401 with a structured reason code. Fails CLOSED if Redis is unavailable.
+  - `BodySignature` verifies `X-APEX-Signature: ed25519:<b64>` against `agents.public_key` (stored as url-safe base64 of the raw 32-byte key — same encoding as JWKS `x`). Every failure mode maps to a specific metric label (`missing`, `malformed`, `invalid`, `unknown_agent`) so dashboards can tell a misconfigured SDK from an attack.
 
 ---
 
@@ -384,11 +448,14 @@ See `docs/SECURITY.md` for the full architecture note tracing each threat-model 
 
 ## Roadmap
 
-- **Migration 003** — lock down Supabase's default `anon`/`authenticated`/`service_role` grants on `audit_logs`. (Currently the app-level roles are correctly scoped, but PostgREST defaults leave a PostgREST-accessible tampering window.)
-- **Persistent Ed25519 key** — ship a key-loading helper so receipts verify across process restarts without hand-rolling base64.
-- **OPA bundle server** — serve `apex.rego` from a signed bundle URL instead of the bundled fallback, so policy updates roll out without redeploying the gateway.
+The full blueprint — including SLO targets, back-of-envelope capacity for a 10k-agent tenant, a CAP breakdown per subsystem, a multi-region topology, and seven open architectural questions — lives in [`docs/BACKEND_BLUEPRINT.md`](docs/BACKEND_BLUEPRINT.md). Short-term items on the implementation side:
+
+- **Default-on request signing** — nonce + body-signature enforcement is feature-flagged today; flip on per-environment once agent SDKs ship with the client-side signer.
+- **OPA bundle server** — serve `apex.rego` from a signed OCI-registry bundle instead of the bundled fallback, so policy updates roll out without redeploying the gateway.
+- **Llama Guard co-location** — when the heuristic classifier is superseded, GPU-backed model servers need to sit next to gateway pods; heuristic stays as the low-risk fast path.
 - **Multi-tenant HITL UI** — the queue and API are done; the reviewer console is currently a single-agent prototype.
-- **Throughput benchmarks at p99** — instrument a load-gen harness and publish numbers against the APEX paper's baselines.
+- **Formal Rego ↔ Python parity** — property-based testing today; SMT-backed equivalence checking is a stretch goal tracked in the blueprint's open questions.
+- **Execution-proxy mode (OPEN)** — should the gateway itself make the downstream tool call for high-risk targets, or always hand the agent a scoped credential? Blueprint §15 lays out the trade.
 
 ---
 

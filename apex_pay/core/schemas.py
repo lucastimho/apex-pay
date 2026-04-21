@@ -40,6 +40,21 @@ class ToolCallPayload(BaseModel):
         max_length=128,
         description="Client-supplied key for idempotent settlement.",
     )
+    nonce: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Client-generated replay-protection nonce. Required when "
+            "SECURITY_REQUIRE_NONCE=true."
+        ),
+    )
+    issued_at: int | None = Field(
+        default=None,
+        description=(
+            "Unix seconds at which the request was signed. Must be within "
+            "the server's SECURITY_NONCE_TTL_SECONDS window."
+        ),
+    )
 
     @field_validator("tool_call")
     @classmethod

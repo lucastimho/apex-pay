@@ -55,6 +55,13 @@ class _SecuritySettings(BaseSettings):
     token_ttl_seconds: int = 300                       # 5-minute token validity
     jwt_algorithm: str = "HS256"
 
+    # ── Request-envelope hardening (blueprint §5.1) ─────────────────────
+    # Both flags default OFF so existing callers keep working. Flip each
+    # one on per environment when the agent SDKs are ready.
+    require_nonce: bool = False               # reject requests missing nonce/issued_at
+    nonce_ttl_seconds: int = 300              # replay window (also the timestamp skew)
+    require_body_signature: bool = False      # reject requests without Ed25519 body sig
+
 
 class _RateLimitSettings(BaseSettings):
     """SlowAPI rate-limit defaults."""

@@ -232,5 +232,12 @@ class OPAClient:
                 "OPA sidecar unreachable (%s); falling back to embedded evaluator.",
                 exc,
             )
+            # Bump the fallback counter so SRE can alert on sidecar flapping.
+            # Import lazily to keep this module free of the metrics dep.
+            try:
+                from apex_pay.services import metrics as _m
+                _m.OPA_FALLBACK.inc()
+            except Exception:  # pragma: no cover
+                pass
             # Fail-closed-to-embedded: we still run the policy, just locally.
             return await self._embedded.evaluate(opa_input)

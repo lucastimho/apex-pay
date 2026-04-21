@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apex_pay.core.database import GatewaySession
 from apex_pay.core.models import Agent, Policy
 from apex_pay.core.schemas import AgentCreate, AgentOut, PolicyCreate, PolicyOut
+from apex_pay.services.policy_cache import default_cache as default_policy_cache
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -85,6 +86,9 @@ async def create_policy(
     session.add(policy)
     await session.commit()
     await session.refresh(policy)
+    # Evict any stale snapshot across all replicas so the new policy takes
+    # effect immediately (bounded by network hop) instead of after a TTL.
+    await default_policy_cache().invalidate(body.agent_id)
     return PolicyOut.model_validate(policy)
 
 

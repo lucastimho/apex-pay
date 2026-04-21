@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apex_pay.core.models import Agent, AuditLog, Policy, Transaction
 from apex_pay.core.schemas import PolicyDecision, ToolCallPayload
+from apex_pay.services.policy_cache import default_cache
 
 
 class PolicyEngine:
@@ -51,17 +52,16 @@ class PolicyEngine:
         if agent.status != "active":
             return self._deny("agent_suspended", f"Agent status is '{agent.status}'.")
 
-        policy = await self._load_active_policy(payload.agent_id, session)
-        if policy is None:
+        policy_snap = await self._load_snapshot(payload.agent_id, session)
+        if policy_snap is None:
             return self._deny("no_active_policy", "No active spending policy found.")
 
         # 2. Extract intent fields ───────────────────────────────────────
         projected_cost = self._extract_cost(payload.tool_call)
         action_domain = self._extract_domain(payload.tool_call)
-        policy_snap = self._snapshot(policy)
 
         # 3. Domain allowlist check ──────────────────────────────────────
-        if not self._domain_allowed(action_domain, policy.allowed_domains):
+        if not self._domain_allowed(action_domain, policy_snap.get("allowed_domains")):
             return self._deny(
                 "domain_not_allowed",
                 f"Domain '{action_domain}' is not in the agent's allowed list.",
@@ -71,13 +71,12 @@ class PolicyEngine:
             )
 
         # 4. Per-transaction cap  (paper: a ≤ M) ────────────────────────
-        if projected_cost is not None and projected_cost > float(
-            policy.max_per_transaction
-        ):
+        max_per_txn = float(policy_snap["max_per_transaction"])
+        if projected_cost is not None and projected_cost > max_per_txn:
             return self._deny(
                 "exceeds_per_transaction_limit",
                 f"Projected cost ${projected_cost:.2f} exceeds per-txn cap "
-                f"${float(policy.max_per_transaction):.2f}.",
+                f"${max_per_txn:.2f}.",
                 projected_cost=projected_cost,
                 action_domain=action_domain,
                 policy_snapshot=policy_snap,
@@ -86,7 +85,7 @@ class PolicyEngine:
         # 5. Daily budget check  (paper: Σ c_i ≤ B_d) ───────────────────
         spent_today = await self._daily_spend(payload.agent_id, session)
         pending_total = spent_today + (projected_cost or 0.0)
-        daily_cap = float(policy.daily_limit)
+        daily_cap = float(policy_snap["daily_limit"])
 
         if pending_total > daily_cap:
             return self._deny(
@@ -130,6 +129,29 @@ class PolicyEngine:
             )
         )
         return result.scalar_one_or_none()
+
+    @classmethod
+    async def _load_snapshot(
+        cls, agent_id: uuid.UUID, session: AsyncSession
+    ) -> dict[str, Any] | None:
+        """Cache-aside read of the active policy snapshot.
+
+        Cache hit → return the memoized dict (no DB roundtrip).
+        Miss → load the row, cache the snapshot, return it.
+        Missing policy is NOT cached: a missing row is fail-closed in the
+        caller, and we want admins to see the fix as soon as they create
+        the policy, not after a TTL expiry.
+        """
+        cache = default_cache()
+        hit = cache.get(agent_id)
+        if hit is not None:
+            return hit
+        policy = await cls._load_active_policy(agent_id, session)
+        if policy is None:
+            return None
+        snap = cls._snapshot(policy)
+        cache.put(agent_id, snap)
+        return snap
 
     @staticmethod
     async def _daily_spend(

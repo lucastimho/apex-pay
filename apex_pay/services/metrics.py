@@ -145,6 +145,18 @@ SIGNATURE_REJECTIONS = Counter(
     ("reason",),  # missing | malformed | invalid | unknown_agent
 )
 
+# ── Semantic (dollar) rate limiter ──────────────────────────────────────────
+SEMANTIC_RATE_LIMIT_REJECTIONS = Counter(
+    "apex_semantic_rate_limit_rejections_total",
+    "Requests rejected because they would exceed the per-agent hourly dollar cap.",
+)
+
+SEMANTIC_RATE_LIMIT_SPEND_CENTS = Histogram(
+    "apex_semantic_rate_limit_spend_cents",
+    "Rolling-window spend (in cents) observed at each check.",
+    buckets=(100, 500, 1000, 2500, 5000, 7500, 10000, 15000, 25000, 50000),
+)
+
 
 def render_latest() -> tuple[bytes, str]:
     """Return (payload, content_type) for the /metrics endpoint."""

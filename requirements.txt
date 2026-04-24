@@ -25,3 +25,7 @@ PyJWT==2.10.1
 
 # HTTP client (for outbound signed requests)
 httpx==0.28.1
+
+# Test-only: in-memory Redis with Lua scripting support so the semantic
+# rate limiter can be tested without a running Redis instance.
+fakeredis[lua]==2.35.1

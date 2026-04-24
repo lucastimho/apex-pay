@@ -34,7 +34,11 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
 - **Policy cache with pub/sub invalidation** — in-process TTL cache keeps the hot path off Postgres; admin edits publish on `apex.policies.invalidate` so peer replicas evict within milliseconds. SQLAlchemy ORM events catch direct-DB edits as a safety net.
 - **Opt-in replay protection + body signing** — nonce/timestamp guard backed by Redis `SET NX`, plus Ed25519 signature verification against each agent's registered public key. Both feature-flagged so agent SDKs can adopt at their own pace.
 - **Monthly partitioning playbook** — migration 004 ships an opt-in `audit_logs_partitioned` table plus `apex_create_audit_partition(year, month)` helper and a documented swap procedure for v3 scale.
-- **138 tests, all green.** Unit + integration coverage across every Shield component, with OPA/Python parity fixtures that catch Rego drift in CI.
+- **FinancialAction sanitization** — strict Pydantic v2 model for monetary intents with Unicode-category injection hardening (rejects `Cc`/`Cf`/`Co`/`Cs`, bidi overrides, zero-width joiners, NFC-decomposed text), content-addressable hashing, and a content-hash column on every audit row so finance can join equivalent intents across transport shapes.
+- **OPA `apex.financial` hard ceiling** — second-gate Rego package that refuses any transaction above the blueprint's $50 ceiling or to a non-allowlisted payment processor, regardless of what per-agent policy says.
+- **HashiCorp Vault credential issuance** — async `VaultClient` with AppRole auth + automatic token renewal, circuit breaker, and transit-engine scope sealing. Every ephemeral credential is response-wrapped (gateway never holds the plaintext secret) and the scope→wrap-token binding is signed by Vault.
+- **Semantic (dollar) rate limiting** — atomic Redis Lua script implements a sliding-window cap on per-agent spend per hour. Twenty concurrent `$10` attempts at a `$100/hr` ceiling deterministically stop at exactly ten admitted, with `Retry-After` derived from the earliest entry's age-out. Fail-closed on Redis outage.
+- **248 tests, all green.** Unit + integration coverage across every Shield component, with OPA/Python parity fixtures that catch Rego drift in CI.
 
 ---
 
@@ -53,6 +57,18 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
                                        │
                                        ▼
                         ┌───────────────────────────────┐
+                        │  FinancialAction sanitiser    │  ← rejects injection,
+                        │  (Pydantic v2, strict)        │    emits content hash
+                        └──────────────┬────────────────┘
+                                       │
+                                       ▼
+                        ┌───────────────────────────────┐
+                        │  SemanticRateLimiter          │  ← $$/hour sliding
+                        │  (Redis Lua, atomic)          │    window, fail-closed
+                        └──────────────┬────────────────┘
+                                       │
+                                       ▼
+                        ┌───────────────────────────────┐
                         │   Legacy policy engine        │   per-tx + daily
                         │   PolicyCache (TTL + pub/sub) │   limits + domains
                         └──────────────┬────────────────┘
@@ -63,8 +79,10 @@ The threat model is taken directly from the **ClawSafety paper (arXiv:2604.01438
                 │  ┌────────────────────────────────────┐  │
                 │  │ 1. canonicalize_intent → SHA-256   │  │
                 │  │ 2. risk_filter (pluggable)         │  │
-                │  │ 3. OPA gate (sidecar + fallback)   │  │
-                │  │ 4. credential_manager (scoped)     │  │
+                │  │ 3. OPA gate (apex + financial)     │  │
+                │  │ 4. credential_manager (Vault or    │  │
+                │  │    dev-HMAC)  ── wrap + transit    │  │
+                │  │    sign  → downstream API          │  │
                 │  │ 5. receipt_service (Ed25519)       │  │
                 │  └────────────────────────────────────┘  │
                 └──────────────┬───────────────────────────┘
@@ -161,6 +179,7 @@ psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -f migrations/001_shield_hardening.sql
 psql "$DATABASE_URL" -f migrations/002_audit_notify.sql
 psql "$DATABASE_URL" -f migrations/003_audit_dedup.sql
+psql "$DATABASE_URL" -f migrations/005_audit_financial_hash.sql
 # migration 004 is OPT-IN for v3 scale — see its header for the cutover procedure.
 
 # Verify all three triggers are present:
@@ -299,12 +318,27 @@ All configuration is environment-driven via `pydantic-settings`. The `.env.examp
 | `SECURITY_REQUIRE_NONCE`             | **Feature flag** (default `false`). Enforce nonce + issued_at window.  |
 | `SECURITY_NONCE_TTL_SECONDS`         | Replay-protection window. Also bounds clock skew. Default 300 s.       |
 | `SECURITY_REQUIRE_BODY_SIGNATURE`    | **Feature flag** (default `false`). Require Ed25519-signed request bodies. |
+| `SECURITY_REQUIRE_FINANCIAL_VALIDATION` | **Feature flag** (default `false`). When ON, monetary tool_calls must parse as a `FinancialAction` or receive a 422 problem+json. When OFF, the sanitizer still attempts parsing on best-effort for the content hash. |
 | `SHIELD_ED25519_PRIVATE_B64`         | Base64 Ed25519 private key for execution receipts. Generate fresh.     |
 | `SHIELD_ED25519_PUBLIC_KEYS_JSON`    | `{kid: b64pub}` verification map. Enables zero-downtime key rotation.  |
 | `SHIELD_OPA_URL`                     | OPA sidecar HTTP endpoint. Leave empty to use Python fallback.         |
 | `SHIELD_RISK_FILTER_URL`             | Optional Llama-Guard-compatible semantic risk classifier.              |
+| `SHIELD_CREDENTIAL_BACKEND`          | `dev` (HMAC) or `vault` (response-wrapped + transit-sealed).           |
+| `SHIELD_VAULT_ADDR`                  | e.g. `https://vault.internal:8200`. Required when backend = `vault`.   |
+| `SHIELD_VAULT_ROLE_ID` / `_SECRET_ID`| AppRole credentials. Load from the orchestrator's secret store, never the .env file. |
+| `SHIELD_VAULT_SECRETS_PATH`          | The dynamic-secret endpoint to read. Default `database/creds/apex-gateway`. |
+| `SHIELD_VAULT_WRAP_TTL`              | Response-wrap lifetime (Vault duration syntax). Default `60s`.         |
+| `SHIELD_VAULT_APPROLE_MOUNT`         | AppRole mount name. Default `approle`.                                 |
+| `SHIELD_VAULT_TRANSIT_MOUNT`         | Transit engine mount. Default `transit`.                               |
+| `SHIELD_VAULT_TRANSIT_KEY`           | Transit key that seals the scope→wrap binding. Default `apex-shield-scope-signer`. |
+| `SHIELD_VAULT_REQUEST_TIMEOUT_SECONDS` | Hot-path budget for a single Vault call. Default `5.0`.              |
+| `SHIELD_VAULT_CIRCUIT_FAILURE_THRESHOLD` | Consecutive failures before the breaker opens. Default `3`.        |
+| `SHIELD_VAULT_CIRCUIT_COOLDOWN_SECONDS`  | Time before the half-open probe is attempted. Default `10.0`.      |
 | `RATELIMIT_DEFAULT`                  | Per-IP SlowAPI default (e.g. `60/minute`).                             |
 | `RATELIMIT_PER_AGENT`                | Per-agent ceiling when `X-APEX-Agent-ID` is present (e.g. `30/minute`). |
+| `RATELIMIT_SEMANTIC_ENABLED`         | **Feature flag** (default `false`). Turn on the dollar-spend sliding-window limiter. Fails closed if Redis is down. |
+| `RATELIMIT_SEMANTIC_WINDOW_SECONDS`  | Rolling-window size. Default `3600` (1 hour).                          |
+| `RATELIMIT_SEMANTIC_DEFAULT_LIMIT_CENTS` | Per-agent spend ceiling in cents. Default `10000` ($100.00).       |
 | `LOGFIRE_TOKEN`                      | Pydantic Logfire — empty = console only.                               |
 
 ---
@@ -399,6 +433,84 @@ The codebase follows a formal backend blueprint ([`docs/BACKEND_BLUEPRINT.md`](d
 - **Opt-in request-envelope hardening** (`SECURITY_REQUIRE_NONCE`, `SECURITY_REQUIRE_BODY_SIGNATURE`) — both default OFF so existing callers keep working. When enabled:
   - `ReplayGuard` uses Redis `SET NX` with a TTL equal to the replay window, so the nonce claim is atomic. Requests with reused nonces or out-of-window `issued_at` get a 401 with a structured reason code. Fails CLOSED if Redis is unavailable.
   - `BodySignature` verifies `X-APEX-Signature: ed25519:<b64>` against `agents.public_key` (stored as url-safe base64 of the raw 32-byte key — same encoding as JWKS `x`). Every failure mode maps to a specific metric label (`missing`, `malformed`, `invalid`, `unknown_agent`) so dashboards can tell a misconfigured SDK from an attack.
+- **`FinancialAction` strict validation** — monetary tool_calls are parsed through a frozen Pydantic v2 model that enforces shape closure (`extra="forbid"`), type closure (`Decimal` amounts, ISO 4217 currency pattern, `HttpUrl` scheme check), and content closure (Unicode-category scan: `Cc`/`Cf`/`Cs`/`Co` refused, classic attack codepoints like `U+202E` RLO and `U+200B` ZWSP explicitly denied, NFC-decomposed text rejected). Failures return RFC-7807 `application/problem+json`; payload content never leaks to logs. Opt-in strict mode via `SECURITY_REQUIRE_FINANCIAL_VALIDATION=true`.
+- **OPA `apex.financial` second gate** — in `policies/financial_actions.rego`, enforces a hard `$50` ceiling and a 10-entry verified-domain allowlist (suffix match, so `stripe.com.evil.com` is denied while `sandbox.api.stripe.com` is allowed). Ten numbered deny rules (`D1..D10`) each emit a structured violation code. Composes with the per-agent `apex.rego` — a deny here overrides any allow upstream.
+- **HashiCorp Vault credentials** — production credential backend runs through `VaultCredentialBackend`:
+  - Async `VaultClient` (no event-loop blocking) with AppRole authentication and automatic token renewal at 80 % of TTL (jittered ±10 % to prevent fleet stampede).
+  - Three-state **circuit breaker** (closed/open/half-open) trips after consecutive 5xx or network errors. Half-open probe after cooldown prevents thundering-herd re-auth.
+  - Every credential issuance = read wrapped dynamic secret + transit-sign the `(scope, wrap_token_digest)` binding, so the scope cannot be tampered with in transit and the gateway never holds the plaintext secret.
+  - Startup probe: FastAPI lifespan `await`s `pipeline.startup()` which does AppRole login AND a transit/sign probe. A misconfigured mount fails container boot rather than the first real request.
+- **Semantic (dollar) rate limiter** — atomic Redis Lua script implements a sliding-window cap on per-agent spend. Blueprint §2.C: "If an agent attempts five `$10` transactions in 10 seconds, the system applies back-pressure." In our implementation, the age-out + sum + check + `ZADD` all happen in one Redis round-trip, so 20 concurrent attempts at a `$100/hr` ceiling deterministically stop at exactly 10 admitted. Rejected requests receive **429** + `Retry-After`. Fails closed on Redis unavailability.
+
+---
+
+## Vault setup playbook
+
+Minimum Vault config to run `SHIELD_CREDENTIAL_BACKEND=vault`. All commands assume an operator with sufficient privileges — in production you'd drive this through Terraform (`hashicorp/vault` provider) rather than the CLI, but the object graph is the same.
+
+1. **Enable the AppRole auth method** so the gateway can authenticate as a service (not a human):
+   ```bash
+   vault auth enable approle
+   ```
+
+2. **Write the gateway policy.** `apex-gateway-policy.hcl` — the absolute minimum capabilities the backend needs:
+   ```hcl
+   path "database/creds/apex-gateway"   { capabilities = ["read"] }
+   path "sys/wrapping/lookup"           { capabilities = ["update"] }
+   path "sys/leases/revoke"             { capabilities = ["update"] }
+   path "transit/sign/apex-shield-scope-signer" { capabilities = ["update"] }
+   path "auth/token/renew-self"         { capabilities = ["update"] }
+   ```
+   Load it:
+   ```bash
+   vault policy write apex-gateway apex-gateway-policy.hcl
+   ```
+
+3. **Create the AppRole role.** Narrow token TTL and bind the secret_id to the gateway's egress CIDR:
+   ```bash
+   vault write auth/approle/role/apex-gateway \
+       token_policies=apex-gateway \
+       token_ttl=1h token_max_ttl=4h \
+       secret_id_ttl=0 \
+       secret_id_bound_cidrs="10.0.0.0/8"
+   ```
+
+4. **Fetch role_id + secret_id** — role_id is not secret; secret_id is. Store the secret_id in the orchestrator (k8s Secret, AWS Secrets Manager, etc.), never in the .env file:
+   ```bash
+   vault read auth/approle/role/apex-gateway/role-id
+   vault write -force auth/approle/role/apex-gateway/secret-id
+   ```
+
+5. **Enable the database secrets engine** and configure a connection + role. Example for PostgreSQL:
+   ```bash
+   vault secrets enable database
+   vault write database/config/apex-pay \
+       plugin_name=postgresql-database-plugin \
+       allowed_roles=apex-gateway \
+       connection_url="postgresql://{{username}}:{{password}}@postgres.internal/apex_pay" \
+       username="vault" password="…"
+   vault write database/roles/apex-gateway \
+       db_name=apex-pay \
+       creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' INHERIT; GRANT apex_gateway TO \"{{name}}\";" \
+       default_ttl=5m max_ttl=1h
+   ```
+
+6. **Enable the transit engine** and create the scope-signer key:
+   ```bash
+   vault secrets enable transit
+   vault write -f transit/keys/apex-shield-scope-signer type=ed25519
+   ```
+
+7. **Verify the gateway can boot** by pointing `SHIELD_CREDENTIAL_BACKEND=vault` at your Vault. On startup the lifespan will:
+   - AppRole-login (populates the service token)
+   - Run a transit/sign probe against `apex-shield-scope-signer` (fails fast if the key is missing)
+
+   If either step fails, boot aborts — this is fail-closed by design. Do not flip the flag on without completing steps 1–6.
+
+**Rotation notes:**
+- AppRole secret_id: issue a new one, deploy to the gateway, then delete the old. The old one becomes invalid the moment Vault records its deletion.
+- transit key: `vault write -f transit/keys/apex-shield-scope-signer/rotate`. New signatures use the new version; old receipts verify against old versions until they age out.
+- Dynamic DB creds: every `/execute` already mints a fresh lease, so no explicit rotation step is needed.
 
 ---
 
@@ -406,7 +518,7 @@ The codebase follows a formal backend blueprint ([`docs/BACKEND_BLUEPRINT.md`](d
 
 ```bash
 python3 -m pytest -q
-# 138 passed, 1 warning in 5.59s
+# 248 passed in ~5s
 ```
 
 Suites:

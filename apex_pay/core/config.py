@@ -56,20 +56,33 @@ class _SecuritySettings(BaseSettings):
     jwt_algorithm: str = "HS256"
 
     # ── Request-envelope hardening (blueprint §5.1) ─────────────────────
-    # Both flags default OFF so existing callers keep working. Flip each
-    # one on per environment when the agent SDKs are ready.
+    # Flags default OFF so existing callers keep working. Flip each one
+    # on per environment when the agent SDKs are ready.
     require_nonce: bool = False               # reject requests missing nonce/issued_at
     nonce_ttl_seconds: int = 300              # replay window (also the timestamp skew)
     require_body_signature: bool = False      # reject requests without Ed25519 body sig
+    # When ON, any monetary tool_call MUST parse as a FinancialAction. When
+    # OFF (default), the sanitizer still attempts parsing on best-effort
+    # so the validated object + content_hash are available downstream, but
+    # a parse failure is downgraded to a warning log and the legacy policy
+    # path continues.
+    require_financial_validation: bool = False
 
 
 class _RateLimitSettings(BaseSettings):
-    """SlowAPI rate-limit defaults."""
+    """SlowAPI rate-limit defaults, plus the semantic ($$) limiter."""
 
     model_config = SettingsConfigDict(env_prefix="RATELIMIT_", env_file=".env", extra="ignore")
 
     default: str = "60/minute"
     per_agent: str = "30/minute"
+
+    # Semantic (dollar-spend) limiter — blueprint §2.C. Defaults aim for a
+    # comfortable envelope on a well-behaved agent: $100 per rolling hour.
+    # Flip `semantic_enabled` on in prod after confirming Redis availability.
+    semantic_enabled: bool = False
+    semantic_window_seconds: int = 3600
+    semantic_default_limit_cents: int = 10_000    # $100.00
 
 
 class _LogfireSettings(BaseSettings):
@@ -119,6 +132,14 @@ class _ShieldSettings(BaseSettings):
     vault_secret_id: str = ""
     vault_secrets_path: str = "database/creds/apex-gateway"
     vault_wrap_ttl: str = "60s"
+    # Mount points for AppRole and Transit engines (override for non-default setups).
+    vault_approle_mount: str = "approle"
+    vault_transit_mount: str = "transit"
+    vault_transit_key: str = "apex-shield-scope-signer"
+    # Resilience knobs.
+    vault_request_timeout_seconds: float = 5.0
+    vault_circuit_failure_threshold: int = 3
+    vault_circuit_cooldown_seconds: float = 10.0
 
     # Ed25519 signing keys.
     ed25519_kid: str = "key-ephemeral"

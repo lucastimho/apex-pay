@@ -37,6 +37,10 @@ from apex_pay.services.audit_queue import AuditQueue
 from apex_pay.services.correlation import CorrelationIdMiddleware
 from apex_pay.services.policy_cache import default_cache as default_policy_cache
 from apex_pay.services.replay_guard import ReplayGuard, set_default_guard
+from apex_pay.services.semantic_rate_limiter import (
+    SemanticRateLimiter,
+    set_default_limiter,
+)
 from apex_pay.workers.audit_worker import drain_audit_queue
 
 logger = logging.getLogger("apex_pay")
@@ -112,6 +116,43 @@ async def lifespan(app: FastAPI):
     else:
         set_default_guard(None)
 
+    # ── Semantic rate limiter (dollar spend / hour) ──────────────────────
+    if settings.rate_limit.semantic_enabled:
+        limiter = SemanticRateLimiter(
+            redis_url=settings.redis.url,
+            window_seconds=settings.rate_limit.semantic_window_seconds,
+            default_limit_cents=settings.rate_limit.semantic_default_limit_cents,
+        )
+        try:
+            await limiter.connect()
+            set_default_limiter(limiter)
+            logger.info(
+                "Semantic rate limiter connected (window=%ds, limit=%d cents)",
+                settings.rate_limit.semantic_window_seconds,
+                settings.rate_limit.semantic_default_limit_cents,
+            )
+        except Exception:
+            logger.error(
+                "Semantic rate limiter could not connect — requests will fail "
+                "closed (503) when evaluated by the limiter.",
+            )
+            set_default_limiter(limiter)
+    else:
+        set_default_limiter(None)
+
+    # ── Shield pipeline startup (Vault AppRole login, transit probe) ─────
+    # Fail-closed: if credential_backend=vault and login fails, we raise
+    # so the container crash-loops instead of serving traffic with a dead
+    # credential manager. Dev backend's startup() is a no-op.
+    from apex_pay.routers.gateway import shield_pipeline as _shield
+    if _shield is not None:
+        try:
+            await _shield.startup()
+            logger.info("Shield pipeline startup complete.")
+        except Exception:
+            logger.exception("Shield pipeline startup failed — aborting boot.")
+            raise
+
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────
@@ -127,6 +168,20 @@ async def lifespan(app: FastAPI):
     rg = _dg()
     if rg is not None:
         await rg.close()
+
+    from apex_pay.services.semantic_rate_limiter import default_limiter as _dl
+    srl = _dl()
+    if srl is not None:
+        await srl.close()
+
+    # Shield shutdown: close Vault HTTP client, drop service token.
+    from apex_pay.routers.gateway import shield_pipeline as _shield
+    if _shield is not None:
+        try:
+            await _shield.shutdown()
+        except Exception:
+            logger.warning("Shield pipeline shutdown failed (non-fatal).", exc_info=True)
+
     await audit_queue.close()
     await dispose_engines()
     logger.info("APEX-Pay shut down cleanly.")

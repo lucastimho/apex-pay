@@ -14,11 +14,14 @@ Rate-limited via SlowAPI to prevent DDoS and agent-looping (blueprint §Step 1).
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
 
 import logfire
+
+logger = logging.getLogger("apex_pay.gateway")
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +44,8 @@ from apex_pay.services.body_signature import verify_body
 from apex_pay.services.correlation import current_correlation_id
 from apex_pay.services.policy_engine import PolicyEngine
 from apex_pay.services.replay_guard import default_guard as default_replay_guard
+from apex_pay.services.sanitization import sanitize_financial_intent
+from apex_pay.services.semantic_rate_limiter import default_limiter as default_semantic_limiter
 from apex_pay.services.token_service import TokenService
 from apex_pay.shield.factory import build_shield_pipeline
 from apex_pay.shield.hitl_store import default_store as default_hitl_store
@@ -96,6 +101,101 @@ async def execute_tool_call(
             status_code=503,
             detail="Audit queue saturated — retry later.",
         )
+
+    # ── Strict sanitisation for monetary intents ─────────────────────────
+    # For any tool_call that smells like money (function name match,
+    # action_type field, or `amount` present), try to parse it as a
+    # FinancialAction. Behaviour on failure depends on the strict flag:
+    #
+    #   SECURITY_REQUIRE_FINANCIAL_VALIDATION=true  →  RFC-7807 422,
+    #     payload is redacted in the audit log, content never reaches
+    #     downstream consumers.
+    #
+    #   flag off (default)  →  warning logged with only field names +
+    #     error types (no payload), request falls through to the legacy
+    #     policy path for backward compatibility.
+    sanitization = sanitize_financial_intent(payload.tool_call)
+    if sanitization.is_problem and settings.security.require_financial_validation:
+        m.DECISIONS.labels(status="DENIED").inc()
+        await audit_queue.push(
+            agent_id=payload.agent_id,
+            raw_intent={
+                "_redacted": "financial-intent-rejected",
+                "function": str(payload.tool_call.get("function") or "")[:64],
+            },
+            projected_cost=None,
+            action_domain=None,
+            risk_score=0.0,
+            status="DENIED",
+            denial_reason="financial_validation_failed",
+            intent_hash=None,
+            financial_action_hash=None,
+            receipt=None,
+        )
+        return Response(
+            status_code=sanitization.status_code,
+            media_type="application/problem+json",
+            content=_json_dumps(sanitization.problem),
+        )
+    # Keep the validated action (or None) on request state for downstream
+    # use (audit hash, OPA second-gate, semantic rate limiter).
+    request.state.financial_action = sanitization.action
+
+    # ── Semantic (dollar-spend) rate limit ───────────────────────────────
+    # Runs before the shield pipeline so a request that would exceed the
+    # agent's hourly dollar envelope is rejected quickly with a 503 +
+    # Retry-After, without consuming OPA/Vault work. Only applies when
+    # we have a validated FinancialAction (i.e. monetary intent).
+    srl = default_semantic_limiter()
+    if srl is not None and sanitization.action is not None:
+        try:
+            rl = await srl.check_and_record(
+                agent_id=str(payload.agent_id),
+                amount=sanitization.action.amount,
+            )
+        except ConnectionError as exc:
+            # Fail-closed: Redis is the authority for the sliding window;
+            # a silent degrade-open would defeat the whole limiter.
+            logger.warning("Semantic rate limiter unavailable: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Semantic rate limiter unavailable (fail-closed).",
+            )
+        m.SEMANTIC_RATE_LIMIT_SPEND_CENTS.observe(float(rl.current_spend_cents))
+        if not rl.allowed:
+            m.SEMANTIC_RATE_LIMIT_REJECTIONS.inc()
+            m.DECISIONS.labels(status="DENIED").inc()
+            await audit_queue.push(
+                agent_id=payload.agent_id,
+                raw_intent={
+                    "_redacted": "semantic-rate-limited",
+                    "function": str(payload.tool_call.get("function") or "")[:64],
+                },
+                projected_cost=float(sanitization.action.amount),
+                action_domain=sanitization.action.target_domain,
+                risk_score=0.0,
+                status="DENIED",
+                denial_reason="semantic_rate_limit_exceeded",
+                intent_hash=None,
+                financial_action_hash=sanitization.action.content_hash(),
+                receipt=None,
+            )
+            return Response(
+                status_code=429,
+                media_type="application/problem+json",
+                content=_json_dumps({
+                    "type": "https://apex-pay.example/problems/rate-limit-exceeded",
+                    "title": "Per-agent hourly dollar limit reached.",
+                    "status": 429,
+                    "detail": (
+                        f"Agent has spent ${rl.current_spend_usd} of "
+                        f"${rl.limit_usd} in the rolling window. "
+                        f"Retry in {rl.retry_after_seconds}s."
+                    ),
+                    "retry_after_seconds": rl.retry_after_seconds,
+                }),
+                headers={"Retry-After": str(rl.retry_after_seconds)},
+            )
 
     # ── Body-signature verification (config-gated; off by default) ─────
     # Blueprint §5.1: agents sign the raw request body with Ed25519. The
@@ -243,6 +343,7 @@ async def execute_tool_call(
     # "ESCALATED" is normalised to DENIED in the log but carries the
     # specific reason so analysts can distinguish them.
     audit_status = status if status in ("APPROVED", "DENIED") else "DENIED"
+    financial_action = getattr(request.state, "financial_action", None)
     await audit_queue.push(
         agent_id=payload.agent_id,
         raw_intent=payload.tool_call,
@@ -255,6 +356,15 @@ async def execute_tool_call(
         denial_reason=reason if not allowed else None,
         policy_snapshot=decision.policy_snapshot,
         latency_ms=round(elapsed_ms, 2),
+        intent_hash=response.intent_hash,
+        financial_action_hash=(
+            financial_action.content_hash() if financial_action is not None else None
+        ),
+        receipt=(
+            shield_decision.receipt.to_dict()
+            if shield_decision is not None and shield_decision.receipt is not None
+            else None
+        ),
     )
 
     # ── Metrics ────────────────────────────────────────────────────────

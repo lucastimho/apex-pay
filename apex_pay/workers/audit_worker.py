@@ -54,13 +54,13 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                                 action_domain, risk_score, status,
                                 denial_reason, transaction_id,
                                 policy_snapshot, latency_ms, created_at,
-                                intent_hash, receipt
+                                intent_hash, financial_action_hash, receipt
                             ) VALUES (
                                 :id, :agent_id, CAST(:raw_intent AS jsonb), :projected_cost,
                                 :action_domain, :risk_score, :status,
                                 :denial_reason, :transaction_id,
                                 CAST(:policy_snapshot AS jsonb), :latency_ms, :created_at,
-                                :intent_hash, CAST(:receipt AS jsonb)
+                                :intent_hash, :financial_action_hash, CAST(:receipt AS jsonb)
                             )
                         """),
                         {
@@ -80,6 +80,7 @@ async def drain_audit_queue(queue: AuditQueue, *, batch_size: int = 50) -> None:
                             # a real datetime; coerce before bind.
                             "created_at": _parse_timestamp(record.get("created_at")),
                             "intent_hash": record.get("intent_hash"),
+                            "financial_action_hash": record.get("financial_action_hash"),
                             "receipt": _to_json_str(record.get("receipt")),
                         },
                     )

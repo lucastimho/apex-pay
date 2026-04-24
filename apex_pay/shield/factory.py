@@ -26,6 +26,7 @@ from apex_pay.shield.opa_client import OPAClient
 from apex_pay.shield.pipeline import ShieldPipeline, ShieldThresholds
 from apex_pay.shield.receipt_service import Ed25519KeyRing, ReceiptService
 from apex_pay.shield.risk_filter import HeuristicClassifier, LlamaGuardAdapter
+from apex_pay.shield.vault_client import VaultClient
 
 logger = logging.getLogger("apex_pay.shield.factory")
 
@@ -65,12 +66,23 @@ def _build_keyring() -> Ed25519KeyRing:
 def _build_credential_manager() -> CredentialManager:
     s = settings.shield
     if s.credential_backend == "vault":
+        # The client is constructed but NOT authenticated here; login happens
+        # in ShieldPipeline.startup() so the FastAPI lifespan can `await` it.
+        client = VaultClient(
+            addr=s.vault_addr,
+            request_timeout=s.vault_request_timeout_seconds,
+            failure_threshold=s.vault_circuit_failure_threshold,
+            cooldown_seconds=s.vault_circuit_cooldown_seconds,
+        )
         return VaultCredentialBackend(
-            vault_addr=s.vault_addr,
+            vault_client=client,
             role_id=s.vault_role_id,
             secret_id=s.vault_secret_id,
             secrets_path=s.vault_secrets_path,
             wrap_ttl=s.vault_wrap_ttl,
+            approle_mount=s.vault_approle_mount,
+            transit_mount=s.vault_transit_mount,
+            transit_key=s.vault_transit_key,
         )
     # Default: dev backend, reusing the HMAC key.
     return DevCredentialBackend(secret_key=settings.security.hmac_secret_key)

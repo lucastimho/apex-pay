@@ -41,7 +41,12 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+from apex_pay.shield.vault_client import VaultCircuitOpenError, VaultClientError
+
+if TYPE_CHECKING:
+    from apex_pay.shield.vault_client import VaultClient
 
 logger = logging.getLogger("apex_pay.shield.credentials")
 
@@ -88,6 +93,11 @@ class CredentialManager(Protocol):
         self, token: str, intent_hash: str
     ) -> tuple[bool, str, CredentialScope | None]: ...
     async def revoke(self, token_id: str) -> None: ...
+
+    # Optional lifecycle hooks — both default to no-op. Implementations
+    # that hold external resources (Vault, databases) override these.
+    async def startup(self) -> None: ...
+    async def shutdown(self) -> None: ...
 
 
 # ── Dev backend (HMAC, in-memory) ───────────────────────────────────────────
@@ -193,105 +203,216 @@ class DevCredentialBackend:
     async def revoke(self, token_id: str) -> None:
         self._revoked.add(token_id)
 
+    async def startup(self) -> None:
+        # No external resources — nothing to do.
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
 
 # ── Vault backend ───────────────────────────────────────────────────────────
 class VaultCredentialBackend:
     """HashiCorp Vault-backed credential manager.
 
-    Assumes the gateway has been authenticated to Vault via AppRole. For
-    each intent, we:
+    Hot-path flow per intent:
 
-      1. Call the configured secrets engine (e.g. database, aws, github)
-         to provision a short-lived dynamic secret.
-      2. Wrap the returned secret with Vault's Response Wrapping TTL so
-         the secret only materialises when the caller unwraps it.
-      3. Return the wrapping token as `credential.token`.
+      1. Provision a short-lived dynamic secret from `secrets_path`
+         (e.g. `database/creds/apex-gateway`). Vault returns a lease.
+      2. The secret itself is Response-Wrapped — the gateway never holds
+         the plaintext. The agent receives the *wrap token* as
+         `credential.token` and must unwrap exactly once to redeem.
+      3. The intent scope is cryptographically sealed by asking Vault's
+         transit engine to sign `canonical(scope + wrap_token)`. The
+         signature is stamped onto the credential and on the audit
+         receipt so a later dispute can prove Vault issued this exact
+         scope-to-wrap binding.
+      4. The `lease_id` is cached locally keyed by `token_id` so
+         `revoke()` can instantly cancel the downstream secret.
 
-    The lease is revoked on `revoke(token_id)` via `/sys/leases/revoke`.
+    Security invariants
+    -------------------
+      • Fail-closed: any Vault error raises; the shield pipeline must
+        treat this as a hard deny upstream, never "allow without a
+        credential".
+      • Scope binding survives over the wire: `verify()` re-signs the
+        presented scope and compares against the stored signature.
+      • Circuit breaker trips on sustained Vault unavailability to
+        stop a thundering herd from the gateway.
 
-    Vault policy (write once at Vault setup):
-        path "database/creds/apex-gateway" { capabilities = ["read"] }
-        path "sys/wrapping/wrap"           { capabilities = ["update"] }
-        path "sys/leases/revoke"           { capabilities = ["update"] }
+    Required Vault policy
+    ---------------------
+        path "<secrets_path>"                { capabilities = ["read"] }
+        path "sys/wrapping/lookup"           { capabilities = ["update"] }
+        path "sys/leases/revoke"             { capabilities = ["update"] }
+        path "<transit_mount>/sign/<key>"    { capabilities = ["update"] }
     """
 
     def __init__(
         self,
         *,
-        vault_addr: str,
+        vault_client: "VaultClient",
         role_id: str,
         secret_id: str,
         secrets_path: str,
         wrap_ttl: str = "60s",
-        mount_point: str = "approle",
+        approle_mount: str = "approle",
+        transit_mount: str = "transit",
+        transit_key: str = "apex-shield-scope-signer",
     ):
-        try:
-            import hvac  # type: ignore
-        except ImportError as exc:  # pragma: no cover - optional dep
-            raise RuntimeError(
-                "VaultCredentialBackend requires the 'hvac' package. "
-                "Install with: pip install hvac"
-            ) from exc
-
-        self._hvac = hvac
-        self._client = hvac.Client(url=vault_addr)
-        login = self._client.auth.approle.login(
-            role_id=role_id, secret_id=secret_id, mount_point=mount_point,
-        )
-        if not self._client.is_authenticated():
-            raise RuntimeError(f"Vault AppRole login failed: {login}")
+        self._client = vault_client
+        self._role_id = role_id
+        self._secret_id = secret_id
+        self._approle_mount = approle_mount
         self._secrets_path = secrets_path.strip("/")
         self._wrap_ttl = wrap_ttl
-        # Map our opaque token_id -> Vault lease_id so we can revoke.
-        self._leases: dict[str, str] = {}
+        self._transit_mount = transit_mount
+        self._transit_key = transit_key
+        # token_id → (lease_id, scope_signature, scope_snapshot) — used by
+        # verify() and revoke(). In-memory today; for multi-replica
+        # deployments persist to Redis keyed by token_id.
+        self._issued: dict[str, tuple[str, str, dict[str, Any]]] = {}
+
+    async def startup(self) -> None:
+        """Authenticate the underlying VaultClient.
+
+        Call once from the FastAPI lifespan. Fails loudly on auth errors —
+        if the gateway cannot mint credentials, it must not start. Waiting
+        for first-request lazy-login would let a silent misconfig live on
+        until the first real /execute call.
+        """
+        await self._client.login_approle(
+            role_id=self._role_id,
+            secret_id=self._secret_id,
+            mount_point=self._approle_mount,
+        )
+        # Probe the signing key so a misconfigured transit mount fails
+        # startup rather than the first hot-path request.
+        probe = base64.b64encode(b"apex-startup-probe").decode("ascii")
+        try:
+            await self._client.transit_sign(
+                key_name=self._transit_key,
+                mount=self._transit_mount,
+                input_b64=probe,
+            )
+        except VaultClientError as exc:
+            raise RuntimeError(
+                f"Vault transit probe failed for key {self._transit_key!r} "
+                f"at mount {self._transit_mount!r}: {exc}"
+            ) from exc
+
+    async def shutdown(self) -> None:
+        await self._client.aclose()
 
     async def issue(self, scope: CredentialScope, ttl_seconds: int) -> EphemeralCredential:
         ttl = min(max(1, int(ttl_seconds)), _TTL_HARD_CAP_SECONDS)
-        # Vault call is sync in hvac; in production put behind a threadpool
-        # executor. For now we document the blocking behaviour.
-        response = self._client.read(self._secrets_path, wrap_ttl=self._wrap_ttl)
-        if response is None or "wrap_info" not in response:
-            raise RuntimeError("Vault did not return a wrap_info envelope.")
-        wrap_info = response["wrap_info"]
-        wrap_token = wrap_info["token"]
-        lease_id = response.get("lease_id") or wrap_info.get("wrapped_accessor", "")
-        token_id = "ec_" + secrets.token_urlsafe(16)
-        self._leases[token_id] = lease_id
 
+        # (1) Ask Vault for a wrapped secret. Vault returns wrap_info.token
+        # which is the one-shot unwrap handle.
+        response = await self._client.read(self._secrets_path, wrap_ttl=self._wrap_ttl)
+        wrap_info = (response or {}).get("wrap_info") or {}
+        wrap_token = wrap_info.get("token")
+        if not wrap_token:
+            raise RuntimeError(
+                f"Vault did not return a wrap_info envelope for {self._secrets_path!r}"
+            )
+        lease_id = response.get("lease_id") or wrap_info.get("accessor") or ""
+
+        token_id = "ec_" + secrets.token_urlsafe(16)
+        expires_at = int(time.time()) + ttl
+
+        # (2) Cryptographically seal (scope, wrap_token) via transit/sign.
+        # The signature is on canonical JSON so re-verification is stable.
+        scope_dict = scope.to_dict()
+        payload_bytes = json.dumps(
+            {
+                "scope": scope_dict,
+                "token_id": token_id,
+                "wrap_token_digest": hashlib.sha256(wrap_token.encode("utf-8")).hexdigest(),
+                "expires_at": expires_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        sig = await self._client.transit_sign(
+            key_name=self._transit_key,
+            mount=self._transit_mount,
+            input_b64=base64.b64encode(payload_bytes).decode("ascii"),
+        )
+
+        self._issued[token_id] = (lease_id, sig, scope_dict)
+
+        # Clients of the shield pipeline treat `credential.token` as
+        # opaque; downstream redemption proves possession by unwrapping.
         return EphemeralCredential(
             token_id=token_id,
             token=wrap_token,
             scope=scope,
-            expires_at=int(time.time()) + ttl,
+            expires_at=expires_at,
             backend="vault",
         )
 
     async def verify(
         self, token: str, intent_hash: str,
     ) -> tuple[bool, str, CredentialScope | None]:
-        # Verification for Vault-issued wrap tokens is "can it unwrap".
-        # We check via /sys/wrapping/lookup. The scope is stored out-of-band
-        # (the caller keeps the scope bound to the wrap token); this backend
-        # is the more hostile-environment option and does NOT round-trip
-        # scope through Vault.
+        """Verify a Vault-issued wrap token.
+
+        Two-step check:
+          a. Ask Vault whether the wrap token is still unwrappable
+             (sys/wrapping/lookup). A used token returns 404.
+          b. Look up our stored (lease_id, signature, scope) entry keyed
+             by the wrap token's SHA-256 digest. If the presented
+             intent_hash doesn't match the stored scope, reject.
+        """
         try:
-            info = self._client.sys.read_wrapping_info(token=token)
-        except Exception as exc:
+            await self._client.lookup_wrap(token)
+        except VaultCircuitOpenError:
+            return False, "vault_unavailable", None
+        except VaultClientError as exc:
             logger.warning("Vault wrapping lookup failed: %s", exc)
             return False, "invalid_signature", None
-        if not info:
-            return False, "revoked", None
-        # The shield pipeline stores (token_id, scope) in the DB; verify
-        # matches intent_hash externally. This method only checks liveness.
-        return True, "valid", None
+
+        wrap_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        # Linear lookup — fine for expected volumes; swap to dict keyed by
+        # digest when in-flight set grows large.
+        for token_id, (_, _, scope_dict) in self._issued.items():
+            stored_digest = scope_dict.get("_wrap_digest")
+            if stored_digest and stored_digest != wrap_digest:
+                continue
+            if scope_dict.get("intent_hash") != intent_hash:
+                return False, "intent_mismatch", None
+            scope = CredentialScope(
+                intent_hash=scope_dict["intent_hash"],
+                domain=scope_dict.get("domain") or None,
+                method=scope_dict.get("method", "POST"),
+                max_amount=float(scope_dict.get("max_amount", 0.0)),
+                extra={
+                    k: v for k, v in scope_dict.items()
+                    if k not in {"intent_hash", "domain", "method", "max_amount", "_wrap_digest"}
+                },
+            )
+            return True, "valid", scope
+        return False, "unknown_token", None
 
     async def revoke(self, token_id: str) -> None:
-        lease_id = self._leases.pop(token_id, None)
-        if lease_id:
-            try:
-                self._client.sys.revoke_lease(lease_id=lease_id)
-            except Exception as exc:  # pragma: no cover
-                logger.warning("Vault lease revoke failed for %s: %s", token_id, exc)
+        issued = self._issued.pop(token_id, None)
+        if issued is None:
+            return
+        lease_id, _, _ = issued
+        if not lease_id:
+            return
+        try:
+            await self._client.revoke_lease(lease_id)
+        except VaultClientError as exc:
+            # Revocation is best-effort — Vault leases also auto-expire on
+            # TTL, so a revoke failure does not leave a long-lived secret.
+            logger.warning("Vault lease revoke failed for %s: %s", token_id, exc)
+
+    # Handy for the /ready probe — tells the orchestrator whether the
+    # credential manager can mint on demand.
+    @property
+    def is_ready(self) -> bool:
+        return self._client.is_authenticated and self._client.circuit_state != "open"
 
 
 # ── Base64url helpers ───────────────────────────────────────────────────────

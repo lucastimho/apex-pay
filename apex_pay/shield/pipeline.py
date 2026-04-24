@@ -112,6 +112,23 @@ class ShieldPipeline:
         self.thresholds = thresholds or ShieldThresholds()
         self.ttl = ephemeral_ttl_seconds
 
+    async def startup(self) -> None:
+        """Initialise backends that need async setup (Vault login, etc.).
+
+        Called once from the FastAPI lifespan after module import. Any
+        failure here is fatal to startup — we fail closed rather than
+        accept requests with a half-initialised credential manager.
+        """
+        startup = getattr(self.credentials, "startup", None)
+        if startup is not None:
+            await startup()
+
+    async def shutdown(self) -> None:
+        """Release backend resources (Vault HTTP clients, etc.)."""
+        shutdown = getattr(self.credentials, "shutdown", None)
+        if shutdown is not None:
+            await shutdown()
+
     async def evaluate(
         self,
         *,
